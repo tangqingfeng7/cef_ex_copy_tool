@@ -1,0 +1,14 @@
+{
+  "presets": [
+    [
+      "@babel/preset-env",
+      {
+        "targets": { "chrome": "70" },
+        "bugfixes": true,
+        "exclude": ["transform-regenerator", "transform-async-to-generator"]
+      }
+    ]
+  ],
+  "compact": false,
+  "comments": false
+}

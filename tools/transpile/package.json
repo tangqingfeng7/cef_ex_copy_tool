@@ -1,0 +1,25 @@
+{
+  "name": "transpile",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node build.js && node --test ../../tests/userscript-runtime.cjs ../../tests/jquery-isolation.cjs ../../tests/clipboard-lifecycle.cjs ../../tests/clipboard-controls.cjs && node ../test-clipboard.cjs ../../out/build/x86-integrated/src/Release/winmm.dll",
+    "package": "node release.js",
+    "build": "node build.js",
+    "serve": "node serve.js",
+    "fetch-vendor": "node fetch-vendor.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@babel/cli": "^7.29.7",
+    "@babel/core": "^7.29.7",
+    "@babel/preset-env": "^7.29.7"
+  },
+  "devDependencies": {
+    "playwright": "1.58.2"
+  }
+}

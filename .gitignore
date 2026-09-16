@@ -1,0 +1,9 @@
+# Generated output and dependencies
+/build/
+/build_js/
+/out/
+/vcpkg_installed/
+**/node_modules/
+
+# Logs
+*.log

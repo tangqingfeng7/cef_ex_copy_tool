@@ -1,0 +1,5 @@
+#pragma once
+
+// Generated from clipboard_fix.js; edit the JS source, not this header.
+static const wchar_t kClipboardRepairScript[] = LR"CEFPASTE(@CLIPBOARD_REPAIR_JS@)CEFPASTE";
+static const wchar_t kUserScriptBootScript[] = LR"CEFBOOT(@USERSCRIPT_BOOT_JS@)CEFBOOT";
