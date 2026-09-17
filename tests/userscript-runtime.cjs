@@ -64,3 +64,20 @@ test('a hanging resource times out, and a failed script entry is not auto-reexec
     await w.__cefRunUserScript(() => {});
     assert.equal(w.__cefUserScriptState.status, 'ready');
 });
+
+test('generated script guard rejects mixed files and diagnostics report the failure', async () => {
+    const guard = fs.readFileSync(path.join(root, 'out/js/dat.js'), 'utf8').split('\n')[0];
+    const { w } = environment(async () => ({ ok: true, text: async () => '{}' }));
+    vm.runInContext(fs.readFileSync(path.join(root, 'scripts/diagnostics.js'), 'utf8'), w);
+    w.__cefUserScriptMetadata.build.id = 'wrong-pair';
+    let entryRan = false;
+    await w.__cefRunUserScript(() => { vm.runInContext(guard, w); entryRan = true; });
+    assert.equal(entryRan, false);
+    assert.equal(w.__cefGetDiagnostics().userscript.reason, 'script-pair-mismatch');
+    assert.equal(w.__cefGetDiagnostics().userscript.status, 'failed');
+    w.__cefUserScriptMetadata.build.id = w.__cefDatBuild.id;
+    await w.__cefRunUserScript(() => { vm.runInContext(guard, w); entryRan = true; });
+    assert.equal(entryRan, true);
+    assert.equal(w.__cefGetDiagnostics().userscript.status, 'ready');
+    assert.equal(w.__cefGetDiagnostics().userscript.reason, null);
+});

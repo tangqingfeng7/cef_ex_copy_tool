@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const babel = require('@babel/core');
+const { sha256, gitInfo } = require('../build-info.cjs');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const SRC = path.join(ROOT, 'scripts', 'dat.js');
@@ -23,12 +24,24 @@ for (const [, key, value] of header[1].matchAll(/^\/\/\s*@([\w]+)\s+(.+)$/gm)) {
     }
 }
 if (!metadata.script.version) throw new Error('Missing script version');
+const shim = fs.readFileSync(path.join(ROOT, 'scripts', 'gm_shim.js'), 'utf8');
+metadata.build = {
+    id: sha256(JSON.stringify([src, shim,
+        fs.readFileSync(path.join(__dirname, 'babel.config.json'), 'utf8'),
+        fs.readFileSync(path.join(__dirname, 'package-lock.json'), 'utf8'),
+        fs.readFileSync(__filename, 'utf8')])),
+    ...gitInfo(ROOT)
+};
 const res = babel.transformSync(src, {
     configFile: path.join(__dirname, 'babel.config.json'),
     filename: SRC,
 });
-fs.writeFileSync(OUT, res.code, 'utf8');
-const shim = fs.readFileSync(path.join(ROOT, 'scripts', 'gm_shim.js'), 'utf8');
+const guard = '(function(w){var build=' + JSON.stringify(metadata.build) + ';' +
+    'w.__cefDatBuild=build;' +
+    'if(!w.__cefUserScriptMetadata||!w.__cefUserScriptMetadata.build||w.__cefUserScriptMetadata.build.id!==build.id){' +
+    'var e=new Error("gm_shim.js and dat.js are from different builds; replace both files");' +
+    'e.code="CEF_SCRIPT_PAIR_MISMATCH";throw e;}})(window);\n';
+fs.writeFileSync(OUT, guard + res.code, 'utf8');
 fs.writeFileSync(path.join(OUT_DIR, 'gm_shim.js'),
     'window.__cefUserScriptMetadata=' + JSON.stringify(metadata) + ';\n' + shim, 'utf8');
 fs.writeFileSync(path.join(OUT_DIR, 'metadata.json'), JSON.stringify(metadata, null, 2));

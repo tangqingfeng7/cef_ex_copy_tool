@@ -1,0 +1,13 @@
+{
+    "C_Cpp.default.configurationProvider": "",
+    "cmake.cmakePath": "D:/Admin/VSBuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe",
+    "cmake.generator": "Visual Studio 17 2022",
+    "cmake.platform": "Win32",
+    "cmake.buildDirectory": "${workspaceFolder}/out/build/x86-integrated",
+    "cmake.configureSettings": {
+        "CMAKE_GENERATOR_INSTANCE": "D:/Admin/VSBuildTools"
+    },
+    "files.associations": {
+        "**/src/*.h": "cpp"
+    }
+}

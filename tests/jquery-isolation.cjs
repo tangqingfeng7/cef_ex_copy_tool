@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { chromium } = require('../tools/transpile/node_modules/playwright');
 const code = fs.readFileSync(path.resolve(__dirname, '../out/js/dat.js'), 'utf8');
+const metadata = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../out/js/metadata.json'), 'utf8'));
 // Run the real bundled jQuery and its integration, stopping before network/API
 // initialization. This isolates the exact bootstrap responsible for the failure.
 const boundary = code.search(/\b(?:const|var|let) HTTP_STATUS =/);
@@ -20,6 +21,7 @@ test('bundled jQuery preserves host plugins and button clicks', async () => {
         async function setup() {
             await page.goto('about:blank');
             await page.setContent('<button id="enter">Test entry</button>');
+            await page.evaluate(value => { window.__cefUserScriptMetadata = value; }, metadata);
             await page.evaluate(() => {
                 window.GM_getValue = (key, value) => value;
                 window.entered = 0;

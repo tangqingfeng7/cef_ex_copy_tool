@@ -15,7 +15,7 @@
 
 #ifdef UNICODE
 typedef std::wstring string_t;
-#elif
+#else
 typedef std::string string_t;
 #endif
 

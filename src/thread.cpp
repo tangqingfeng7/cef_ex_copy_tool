@@ -1,6 +1,7 @@
 ﻿#include "pch.h"
 #include "detours/detours.h"
 #include "clipboard_repair.h"
+#include "build_info.h"
 #include "instance_hooks.h"
 #include "cef_frame_scope.h"
 #include <vector>
@@ -23,6 +24,27 @@ PVOID g_cef_browser_host_create_browser = nullptr;
 // 功能开关：从宿主 exe 同目录读取 gm_shim.js + dat.js 注入外部油猴脚本。
 // 置 0 可关闭外部脚本注入。
 #define ENABLE_USERSCRIPT 1
+
+// The record is embedded in the DLL and read by the release verifier.
+static const wchar_t kBuildRecord[] = CEF_CX_BUILD_RECORD;
+static const size_t kBuildRecordPrefix = sizeof(L"CEF_CX_BUILD_INFO_V1:") / sizeof(wchar_t) - 1;
+
+static std::wstring RuntimeVersionJson() {
+    auto module = GetModuleHandleW(L"libcef.dll");
+    using VersionInfo = int(__cdecl*)(int);
+    auto version = module ? reinterpret_cast<VersionInfo>(GetProcAddress(module, "cef_version_info")) : nullptr;
+    if (!version) return L"{\"cef\":\"unknown\",\"chromium\":\"unknown\"}";
+    // Indices are defined in CEF's tools/make_version_header.py.
+    auto parts = [version](int start, int count) {
+        std::wstring result;
+        for (int i = 0; i < count; ++i) {
+            if (i) result += L'.';
+            result += std::to_wstring(version(start + i));
+        }
+        return result;
+    };
+    return L"{\"cef\":\"" + parts(0, 3) + L"\",\"chromium\":\"" + parts(4, 4) + L"\"}";
+}
 
 PVOID g_set_window_display_affinity = nullptr;
 PVOID g_set_windows_hook_ex_w = nullptr;
@@ -297,6 +319,7 @@ static void InjectScriptChunked(struct _cef_frame_t* frame,
         L"(0,eval)(__ws);"
         L"console.log('[CefHook] [" + label + L"] eval OK');"
         L"}catch(e){"
+        L"window.__cefUserScriptState={status:'failed',phase:'eval',reason:'eval-" + label + L"',attempts:0};"
         L"console.error('[CefHook] [" + label + L"] eval FAIL:',e&&e.message);"
         L"try{"
         L"var m=String(e&&e.stack||'').match(/<anonymous>:(\\d+):(\\d+)/);"
@@ -320,12 +343,14 @@ static void InjectUserScript(struct _cef_frame_t* frame) {
     std::wstring shim, mainScript;
     if (!ReadFileUtf8ToWString(dir + L"\\gm_shim.js", shim)) {
         OutputDebugString(L"[CefHook] gm_shim.js not found, skip userscript\n");
-        ExecJs(frame, L"console.warn('[CefHook] gm_shim.js 未找到');");
+        ExecJs(frame, L"window.__cefUserScriptState={status:'skipped',reason:'shim-missing-or-unreadable'};"
+            L"console.warn('[CefHook] gm_shim.js 缺失或无法读取');");
         return;
     }
     if (!ReadFileUtf8ToWString(dir + L"\\dat.js", mainScript)) {
         OutputDebugString(L"[CefHook] dat.js not found, skip userscript\n");
-        ExecJs(frame, L"console.warn('[CefHook] dat.js 未找到');");
+        ExecJs(frame, L"window.__cefUserScriptState={status:'skipped',reason:'dat-missing-or-unreadable'};"
+            L"console.warn('[CefHook] dat.js 缺失或无法读取');");
         return;
     }
 
@@ -353,8 +378,17 @@ static void InjectCrackShim(struct _cef_frame_t* frame) {
     if (!FrameCanExecute(frame) || !func_cef_string_from_ptr) return;
     cef_string_t code{};
     cef_string_t url{};
-    if (func_cef_string_from_ptr(kClipboardRepairScript,
-        (sizeof(kClipboardRepairScript) / sizeof(wchar_t)) - 1, &code)) {
+    std::wstring script = L"window.__cefBuildInfo=" + std::wstring(kBuildRecord + kBuildRecordPrefix) +
+        L";window.__cefRuntimeInfo=" + RuntimeVersionJson() + L";\n";
+#if !ENABLE_USERSCRIPT
+    script += L"window.__cefUserScriptState={status:'disabled',reason:'build-option'};\n";
+#else
+    if (frame->is_main && !frame->is_main(frame))
+        script += L"window.__cefUserScriptState={status:'skipped',reason:'subframe'};\n";
+#endif
+    script += kClipboardRepairScript;
+    script += kDiagnosticsScript;
+    if (func_cef_string_from_ptr(script.c_str(), script.size(), &code)) {
         frame->execute_java_script(frame, &code, &url, 0);
     }
     if (code.dtor) code.dtor(code.str);
@@ -476,6 +510,8 @@ BOOL APIENTRY InstallHook() {
 
 DWORD WINAPI ThreadProc(LPVOID lpThreadParameter)
 {
+    OutputDebugStringW(L"[CefHook] " CEF_CX_BUILD_RECORD L"\n");
+    OutputDebugStringW((L"[CefHook] runtime " + RuntimeVersionJson() + L"\n").c_str());
 #if ENABLE_MEMORY_PATCH
     HANDLE hProcess = OpenProcess(
         PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,

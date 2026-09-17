@@ -1,0 +1,34 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "compilerPath": "D:/Admin/VSBuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x86/cl.exe",
+            "compilerArgs": [
+                "/utf-8"
+            ],
+            "intelliSenseMode": "windows-msvc-x86",
+            "windowsSdkVersion": "10.0.26100.0",
+            "cppStandard": "c++14",
+            "cStandard": "c17",
+            "defines": [
+                "UNICODE",
+                "_UNICODE",
+                "NDEBUG"
+            ],
+            "includePath": [
+                "${workspaceFolder}/src",
+                "${workspaceFolder}/cef",
+                "${workspaceFolder}/chromium",
+                "${workspaceFolder}/out/build/x86-integrated/src/generated",
+                "${workspaceFolder}/out/build/x86-Release/vcpkg_installed/x86-windows/include",
+                "D:/Admin/VSBuildTools/VC/Tools/MSVC/14.44.35207/include",
+                "D:/Admin/WindowsKits/10/Include/10.0.26100.0/ucrt",
+                "D:/Admin/WindowsKits/10/Include/10.0.26100.0/shared",
+                "D:/Admin/WindowsKits/10/Include/10.0.26100.0/um",
+                "D:/Admin/WindowsKits/10/Include/10.0.26100.0/winrt",
+                "D:/Admin/WindowsKits/10/Include/10.0.26100.0/cppwinrt"
+            ]
+        }
+    ],
+    "version": 4
+}
