@@ -1,5 +1,7 @@
 # cef_cx_copy_tool
 
+[![Windows x86 build](https://github.com/tangqingfeng7/cef_ex_copy_tool/actions/workflows/build.yml/badge.svg)](https://github.com/tangqingfeng7/cef_ex_copy_tool/actions/workflows/build.yml)
+
 基于 CEF Hook 的 Windows 客户端扩展，用于恢复页面文字选择、复制粘贴，并提供可选的外部用户脚本加载能力。项目修改自 [kazutoiris/cef-hook](https://github.com/kazutoiris/cef-hook)。
 
 当前构建目标为 **Windows x86（32 位）**，输出文件为 `winmm.dll`。仅支持与当前 Hook 接口兼容的 CEF 客户端，不保证适用于所有客户端版本。
@@ -76,7 +78,7 @@ out/build/x86-integrated/src/Release/winmm.dll
 out/build/x86-integrated/src/Release/winmm.pdb
 ```
 
-工具链安装在其他位置时，传入实际路径：
+构建脚本会依次检查显式参数、`VSINSTALLDIR`、`D:\Admin\VSBuildTools` 和 Visual Studio Installer。工具链安装在其他位置且无法自动发现时，传入实际路径：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/build-dll.ps1 -BuildToolsPath 'D:\YourTools\VSBuildTools'
@@ -109,7 +111,7 @@ powershell -ExecutionPolicy Bypass -File tools/test.ps1
 npm run package --prefix tools/transpile
 ```
 
-统一验证会重新编译 DLL、运行原生回调测试、构建 JavaScript，并检查源码指纹、诊断状态、脚本配对与初始化、jQuery 隔离、页面重建、控件交互和浏览器粘贴行为。浏览器测试还会从 DLL 中提取内置脚本，确认其与源码一致。测试使用本地页面与临时目录，不操作考试页面或客户端安装目录。
+统一验证会重新编译 DLL、运行原生回调与隔离崩溃转储测试、构建 JavaScript，并检查源码指纹、诊断状态、脚本配对与初始化、jQuery 隔离、页面重建、控件交互和浏览器粘贴行为。浏览器测试还会从 DLL 中提取内置脚本，确认其与源码一致。测试使用本地页面与临时目录，不操作考试页面或客户端安装目录。
 
 测试脚本同样支持 `-BuildToolsPath` 参数。若 DLL 已经编译且只需检查 JavaScript，可运行 `npm test --prefix tools/transpile`；该命令不会重新编译 DLL。
 
@@ -120,10 +122,31 @@ npm run package --prefix tools/transpile
 ├── winmm.dll
 ├── gm_shim.js
 ├── dat.js
-└── manifest.json
+├── README.txt
+├── LICENSE
+├── manifest.json
+├── archives.json
+├── cef_ex_copy_tool-v<版本>-x86-<提交号>[-dirty].zip
+├── cef_ex_copy_tool-v<版本>-x86-<提交号>[-dirty]-symbols.zip
+└── symbols/
+    ├── winmm.pdb
+    ├── symbols.json
+    └── README.txt
 ```
 
-**打包会重新构建 JavaScript，但使用现有 DLL，不会编译 DLL、生成 ZIP 或部署到客户端。** 修改 DLL 源码或内置脚本后，必须先重新编译或运行统一验证。
+**打包会重新构建 JavaScript，并生成运行 ZIP 与独立的调试符号 ZIP；使用现有 DLL，不会编译 DLL 或部署到客户端。** 修改 DLL 源码或内置脚本后，必须先重新编译或运行统一验证。
+
+运行 ZIP 包含三个运行文件、使用说明、许可证与校验清单；符号 ZIP 包含 `winmm.pdb`、符号清单和调试说明。打包会校验 PDB 的 GUID、age 与 DLL 是否匹配，缺少或不匹配时停止。`archives.json` 记录两个 ZIP 的 SHA-256；生成后还会解压读取各条目，核对文件哈希。全部检查成功才生成正式发布目录，失败中间产物保留在 `.partial-*` 目录。
+
+统一测试也包含实际打包与 ZIP 内容校验，因此测试通过后会留下一个可用发布目录。
+
+### GitHub Actions 自动构建
+
+`.github/workflows/build.yml` 在每次 push、Pull Request、版本标签和手动触发时运行。Windows Runner 会按照 `vcpkg-configuration.json` 的 baseline 安装 x86 Detours，使用锁文件执行 `npm ci`，然后运行与本地相同的 `tools/test.ps1` 完整验证。
+
+验证通过后，Actions 分别上传运行 ZIP 和与其匹配的符号 ZIP，并附带 `archives.json`。版本标签必须与 `VERSION` 完全一致，例如 `VERSION` 为 `1.0.0` 时只能使用 `v1.0.0`；不匹配会在编译前停止。自动构建只生成 GitHub Actions 工件，不创建 GitHub Release，也不会部署到客户端。工件默认保留 30 天，失败日志保留 7 天。
+
+vcpkg 二进制缓存与 npm 缓存会在后续运行复用。Dependabot 每周检查 GitHub Actions 主版本更新。
 
 打包前会读取 DLL 内嵌的构建记录，与当前源码指纹、`VERSION`、Git 提交号及 `x86/Release` 配置比较。不匹配、缺少构建记录时会报错并停止，不会生成发布目录。源码指纹覆盖 `src/`、`cef/`、`chromium/`、内置脚本和相关构建文件，包含尚未提交的源码内容，不依赖文件修改时间。
 
@@ -175,12 +198,30 @@ __cefGetDiagnostics()
 | --- | --- |
 | `dll` | DLL 版本、Git 提交号、构建时的 `dirty` 标记、源码指纹和构建配置 |
 | `runtime` | 实际加载的 CEF 三段版本和 Chromium 四段版本；版本接口不可用时显示 `unknown` |
+| `native.host` | 宿主进程名、PID 与 DLL 架构 |
+| `native.lifecycle` | 工作线程的 `starting/running/stopping/stopped/failed` 状态、停止请求和 Win32 错误码 |
+| `native.hooks` | Detours 事务状态、失败阶段及错误码 |
+| `native.crashDump` | 崩溃转储处理器状态、保存目录及最近错误码 |
 | `clipboard` | 当前文档的粘贴补丁安装状态 |
-| `userscript` | 脚本版本、配套构建标识、加载状态、阶段、尝试次数和失败/跳过原因 |
+| `userscript` | 脚本版本、配套构建标识、加载状态、阶段、尝试次数、原因和 `failedFile`（失败文件） |
 
-脚本状态包括 `idle`、`loading`、`ready`、`failed`、`skipped` 和 `disabled`。缺失文件、子框架跳过、编译时禁用会分别给出原因；`ready` 仅表示脚本入口完成，不表示所有后续网络请求成功。普通主页面尚未执行加载回调时可显示 `idle`。
+脚本状态包括 `idle`、`loading`、`ready`、`failed`、`skipped` 和 `disabled`。读取、解码、解析失败分别显示 `read`、`decode`、`eval` 阶段，并保留失败文件；初始化和入口执行分别使用 `boot`、`run` 阶段。子框架跳过、编译时禁用也会给出原因。`ready` 仅表示脚本入口完成，不表示所有后续网络请求成功。普通主页面尚未执行加载回调时可显示 `idle`。
+
+同一次注入保留第一个读取/解析失败，不会被后续初始化或旧的异步任务覆盖；运行时脚本解析失败时不执行主脚本。页面后续发起新的加载尝试后才清除该次错误。已经处于 `loading` 或 `ready` 的脚本不会重复执行。
+
+外部脚本采用进程内缓存，每个文件保留一份处理后的数据，复用 UTF-8 转码、主脚本包装和 Base64 编码结果。每次加载仍检查文件身份、大小、最后写入时间和变更时间；变化时重新读取，文件缺失、锁定、空文件或非法 UTF-8 不会沿用旧缓存。缓存不跨进程持久化，也不会把磁盘更新自动应用到已经执行成功的页面；更新文件后仍应重启客户端。
 
 DLL 版本由根目录 `VERSION` 管理，文件属性的“详细信息”中也可查看。原生调试输出使用 `[CefHook]` 前缀，包含构建记录和运行时版本；诊断快照不包含页面 URL、答题内容或剪贴板正文。未提交源码通过指纹区分，不能只凭 Git 提交号判断两个 DLL 完全相同。
+
+## 崩溃转储
+
+工作线程启动时安装未处理异常过滤器，并保留、调用客户端当时已有的过滤器。发生未处理异常时最多写入一份带 DLL 版本、进程号和时间的 MiniDump：
+
+```text
+%LOCALAPPDATA%\cef_ex_copy_tool\crash-dumps\cef_ex_copy_tool-v1.1.0-pid<进程号>-<时间>.dmp
+```
+
+可在启动客户端前通过环境变量 `CEF_CX_DUMP_DIR` 指定其他本地目录。转储不会自动上传，也不会写入客户端安装目录。MiniDump 可能包含线程栈和部分进程内存；提供给他人分析前应按本地数据处理，并同时保留同次构建的符号 ZIP。
 
 ## 常见问题
 
@@ -194,7 +235,7 @@ DLL 版本由根目录 `VERSION` 管理，文件属性的“详细信息”中�
 
 **进入页面后出现异常或客户端崩溃？**
 
-退出客户端后恢复备份。排查外部脚本时，可以暂时移出客户端目录中的两个 JS 文件，再启动验证。保留发生问题的 DLL、对应 PDB 和崩溃报告，避免混用不同构建的符号文件。当前不支持运行期间强制卸载 DLL。
+退出客户端后恢复备份。排查外部脚本时，可以暂时移出客户端目录中的两个 JS 文件，再启动验证。到 `%LOCALAPPDATA%\cef_ex_copy_tool\crash-dumps` 查找对应 `.dmp`，并保留发生问题的 DLL、同次构建的符号 ZIP，避免混用不同构建的符号文件。当前不支持运行期间强制卸载 DLL。
 
 **为什么某些输入框仍不能粘贴？**
 

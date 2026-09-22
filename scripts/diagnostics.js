@@ -6,6 +6,12 @@
         return JSON.parse(JSON.stringify({
             dll: w.__cefBuildInfo || null,
             runtime: w.__cefRuntimeInfo || { cef: 'unknown', chromium: 'unknown' },
+            native: w.__cefNativeInfo || {
+                host: { process: 'unknown', pid: null, architecture: 'x86' },
+                lifecycle: { status: 'unknown', stopRequested: false, lastError: 0 },
+                hooks: { status: 'unknown', phase: 'none', lastError: 0 },
+                crashDump: { status: 'unknown', directory: '', lastError: 0 }
+            },
             clipboard: w.__cefPasteFixDocument === w.document ? 'installed' : 'not-installed',
             userscript: {
                 version: metadata.script && metadata.script.version || null,
@@ -14,7 +20,8 @@
                 status: state.status || 'idle',
                 phase: state.phase || null,
                 attempts: state.attempts || 0,
-                reason: state.reason || null
+                reason: state.reason || null,
+                failedFile: state.failedFile || null
             }
         }));
     };

@@ -1,0 +1,132 @@
+name: Windows x86 build
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-package:
+    name: Build, test and package
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}\vcpkg-cache
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $expected = 'v' + (Get-Content -LiteralPath VERSION -Raw).Trim()
+          if ($env:TAG_NAME -ne $expected) {
+            throw "Tag $env:TAG_NAME does not match VERSION ($expected)."
+          }
+          if (git status --porcelain) {
+            throw 'Tagged source checkout is not clean.'
+          }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tools/transpile/package-lock.json
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-windows-x86-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+      - name: Install x86 native dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $vcpkg = if ($env:VCPKG_INSTALLATION_ROOT) {
+            Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
+          } else { 'C:\vcpkg\vcpkg.exe' }
+          if (-not (Test-Path -LiteralPath $vcpkg)) {
+            throw 'vcpkg.exe was not found on the GitHub-hosted runner.'
+          }
+          & $vcpkg install --triplet x86-windows `
+            "--x-manifest-root=$env:GITHUB_WORKSPACE" `
+            "--x-install-root=$env:GITHUB_WORKSPACE\vcpkg_installed"
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg dependency installation failed.' }
+
+      - name: Install JavaScript dependencies
+        shell: pwsh
+        run: npm ci --prefix tools/transpile
+
+      - name: Build and run complete test suite
+        shell: pwsh
+        run: ./tools/test.ps1
+
+      - name: Locate verified release archives
+        id: release
+        shell: pwsh
+        run: |
+          $release = Get-ChildItem -LiteralPath out/release -Directory |
+            Where-Object Name -NotLike '.partial-*' |
+            Sort-Object LastWriteTimeUtc |
+            Select-Object -Last 1
+          if (-not $release) { throw 'Verified release directory was not generated.' }
+          $runtime = @(Get-ChildItem -LiteralPath $release.FullName -File -Filter '*.zip' |
+            Where-Object Name -NotLike '*-symbols.zip')
+          $symbols = @(Get-ChildItem -LiteralPath $release.FullName -File -Filter '*-symbols.zip')
+          if ($runtime.Count -ne 1 -or $symbols.Count -ne 1) {
+            throw "Expected one runtime ZIP and one symbol ZIP; found $($runtime.Count) and $($symbols.Count)."
+          }
+          "runtime_zip=$($runtime[0].FullName)" >> $env:GITHUB_OUTPUT
+          "symbols_zip=$($symbols[0].FullName)" >> $env:GITHUB_OUTPUT
+          "archives_json=$(Join-Path $release.FullName 'archives.json')" >> $env:GITHUB_OUTPUT
+
+      - name: Upload runtime package
+        uses: actions/upload-artifact@v7
+        with:
+          name: cef-ex-copy-tool-runtime-${{ github.sha }}
+          path: |
+            ${{ steps.release.outputs.runtime_zip }}
+            ${{ steps.release.outputs.archives_json }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload matching symbols
+        uses: actions/upload-artifact@v7
+        with:
+          name: cef-ex-copy-tool-symbols-${{ github.sha }}
+          path: ${{ steps.release.outputs.symbols_zip }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cef-ex-copy-tool-failure-${{ github.sha }}
+          path: |
+            out/build/**/Testing/Temporary/**
+            out/release/.partial-*/**
+          if-no-files-found: warn
+          retention-days: 7

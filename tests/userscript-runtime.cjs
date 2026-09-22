@@ -81,3 +81,42 @@ test('generated script guard rejects mixed files and diagnostics report the fail
     assert.equal(w.__cefGetDiagnostics().userscript.status, 'ready');
     assert.equal(w.__cefGetDiagnostics().userscript.reason, null);
 });
+
+test('shim parse failure survives bootstrap reinjection and blocks the main script', async () => {
+    const { w } = environment(async () => ({ ok: true, text: async () => '{}' }));
+    w.__cefInjectionAllowed = w.__cefBeginUserScriptInjection();
+    w.__cefEvaluateScript('gm_shim.js', 'function (');
+    const state = w.__cefUserScriptState;
+    assert.equal(state.failedFile, 'gm_shim.js');
+    assert.equal(state.phase, 'eval'); assert.equal(state.reason, 'parse-error');
+    vm.runInContext(boot, w);
+    w.__cefEvaluateScript('dat.js', 'window.unexpected = true');
+    await w.__cefRunUserScript(() => assert.fail('failed shim must block entry'));
+    assert.equal(w.unexpected, undefined);
+    assert.equal(w.__cefUserScriptState, state);
+    assert.equal(state.failedFile, 'gm_shim.js');
+    w.__cefInjectionAllowed = w.__cefBeginUserScriptInjection();
+    w.__cefEvaluateScript('dat.js', 'window.__cefRunUserScript(function(){window.recovered=true;})');
+    await state.promise;
+    assert.equal(state.status, 'ready'); assert.equal(w.recovered, true);
+    assert.equal(w.__cefBeginUserScriptInjection(), false);
+});
+
+test('parse/read failures are not overwritten by an older asynchronous boot', async () => {
+    const { w, timers } = environment(async () => ({ ok: true, text: async () => '{}' }));
+    let resolveBoot;
+    w.__wnBootGM = () => new Promise(resolve => { resolveBoot = resolve; });
+    const pending = w.__cefRunUserScript(() => assert.fail('cancelled entry'));
+    await flush();
+    w.__cefReportUserScriptFailure('dat.js', 'eval', 'parse-error');
+    resolveBoot(); await pending;
+    assert.equal(w.__cefUserScriptState.status, 'failed');
+    assert.equal(w.__cefUserScriptState.failedFile, 'dat.js');
+    assert.equal(w.__cefUserScriptState.phase, 'eval');
+    assert.equal(timers.size, 0);
+    w.__cefBeginUserScriptInjection();
+    w.__cefReportUserScriptFailure('gm_shim.js', 'read', 'missing-or-unreadable');
+    vm.runInContext(boot, w);
+    assert.equal(w.__cefUserScriptState.phase, 'read');
+    assert.equal(w.__cefUserScriptState.failedFile, 'gm_shim.js');
+});

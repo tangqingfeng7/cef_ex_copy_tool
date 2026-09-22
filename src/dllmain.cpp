@@ -400,36 +400,23 @@ FARPROC pfnAheadLib_wod32Message;
 
 static
 HMODULE g_OldModule = NULL;
-
-VOID WINAPI Free()
-{
-	if (g_OldModule)
-	{
-		FreeLibrary(g_OldModule);
-	}
-}
+static bool g_ProxyInitFailed = false;
 
 
 BOOL WINAPI Load()
 {
 	TCHAR tzPath[MAX_PATH];
-	TCHAR tzTemp[MAX_PATH * 2];
-
-	//
-	// 这里是否从系统目录或当前目录加载原始DLL
-	//
-	//GetModuleFileName(NULL,tzPath,MAX_PATH); //获取本目录下的
-	//PathRemoveFileSpec(tzPath);
-
-	GetSystemDirectory(tzPath, MAX_PATH); //默认获取系统目录的
-
-	lstrcat(tzPath, TEXT("\\winmm.dll"));
-
-	g_OldModule = LoadLibrary(tzPath);
+	DWORD length = GetSystemDirectory(tzPath, MAX_PATH);
+	if (!length || length >= MAX_PATH || length + 10 >= MAX_PATH)
+	{
+		OutputDebugString(TEXT("[CefHook] cannot resolve the system directory\n"));
+		return FALSE;
+	}
+	wcscat_s(tzPath, TEXT("\\winmm.dll"));
+	g_OldModule = LoadLibraryW(tzPath);
 	if (g_OldModule == NULL)
 	{
-		wsprintf(tzTemp, TEXT("无法找到模块 %s,程序无法正常运行"), tzPath);
-		MessageBox(NULL, tzTemp, TEXT("AheadLib"), MB_ICONSTOP);
+		OutputDebugString(TEXT("[CefHook] cannot load the system winmm.dll\n"));
 	}
 
 	return (g_OldModule != NULL);
@@ -440,27 +427,18 @@ BOOL WINAPI Load()
 FARPROC WINAPI GetAddress(PCSTR pszProcName)
 {
 	FARPROC fpAddress;
-	CHAR szProcName[64];
-	TCHAR tzTemp[MAX_PATH];
-
 	fpAddress = GetProcAddress(g_OldModule, pszProcName);
 	if (fpAddress == NULL)
 	{
-		if (HIWORD(pszProcName) == 0)
-		{
-			wsprintfA(szProcName, "#%s", pszProcName);
-			pszProcName = szProcName;
-		}
-
-		wsprintf(tzTemp, TEXT("无法找到函数 %hs,程序无法正常运行"), pszProcName);
-		MessageBox(NULL, tzTemp, TEXT("AheadLib"), MB_ICONSTOP);
-		ExitProcess(UINT(-2));
+		g_ProxyInitFailed = true;
+		OutputDebugString(TEXT("[CefHook] a required system winmm export is missing\n"));
 	}
 	return fpAddress;
 }
 
 BOOL WINAPI Init()
 {
+	g_ProxyInitFailed = false;
 	pfnAheadLib_Unnamed2 = GetAddress(MAKEINTRESOURCEA(2));
 	pfnAheadLib_mciExecute = GetAddress("mciExecute");
 	pfnAheadLib_CloseDriver = GetAddress("CloseDriver");
@@ -654,10 +632,11 @@ BOOL WINAPI Init()
 	pfnAheadLib_waveOutWrite = GetAddress("waveOutWrite");
 	pfnAheadLib_wid32Message = GetAddress("wid32Message");
 	pfnAheadLib_wod32Message = GetAddress("wod32Message");
-	return TRUE;
+	return g_ProxyInitFailed ? FALSE : TRUE;
 }
 
-extern DWORD WINAPI ThreadProc(LPVOID lpThreadParameter);
+extern BOOL StartCefHookWorker();
+extern void SignalCefHookShutdown();
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
 {
@@ -665,29 +644,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
 	if (dwReason == DLL_PROCESS_ATTACH)
 	{
 		DisableThreadLibraryCalls(hModule);
-
-		if (Load() && Init())
-		{
-			TCHAR szCurName[MAX_PATH];
-
-			GetModuleFileName(NULL, szCurName, MAX_PATH);
-			PathStripPath(szCurName);
-
-			//是否判断宿主进程名
-			if (endsWith(szCurName, TEXT(".exe")))
-			{
-				//启动补丁线程或者其他操作
-				HANDLE hThread = CreateThread(NULL, NULL, ThreadProc, NULL, NULL, NULL);
-				if (hThread)
-				{
-					CloseHandle(hThread);
-				}
-			}
-		}
+		// The forwarding table must be ready before any naked winmm export can run.
+		// All hook, diagnostics and crash-dump initialization is deferred to one worker.
+		if (!Load() || !Init()) return FALSE;
+		StartCefHookWorker();
 	}
 	else if (dwReason == DLL_PROCESS_DETACH)
 	{
-		Free();
+		// Never wait while holding the loader lock. The worker observes this event
+		// and the module pins itself because runtime unloading is unsupported.
+		SignalCefHookShutdown();
 	}
 
 	return TRUE;

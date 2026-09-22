@@ -31,7 +31,7 @@ test('source fingerprint notices edits with unchanged timestamps and added/delet
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     for (const dir of ['src', 'cef', 'chromium', 'tools', 'scripts']) fs.mkdirSync(path.join(root, dir));
     for (const file of ['CMakeLists.txt', 'vcpkg.json', 'vcpkg-configuration.json',
-        'tools/build-info.cjs', 'tools/build-dll.ps1', 'scripts/clipboard_fix.js',
+        'tools/build-info.cjs', 'tools/build-environment.ps1', 'tools/build-dll.ps1', 'scripts/clipboard_fix.js',
         'scripts/userscript_boot.js', 'scripts/diagnostics.js', 'src/main.cpp'])
         fs.writeFileSync(path.join(root, file), 'first');
     fs.writeFileSync(path.join(root, 'VERSION'), '1.0.0\n');

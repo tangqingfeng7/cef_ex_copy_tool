@@ -86,6 +86,11 @@ int main() {
         RememberKeyboardHook(WH_KEYBOARD_LL, reinterpret_cast<HHOOK>(1));
         CHECK(g_keyboard_hooks.size() == 70);
         g_keyboard_hooks.clear();
+        const std::wstring native = NativeDiagnosticsJson();
+        CHECK(native.find(L"\"architecture\":\"x86\"") != std::wstring::npos);
+        CHECK(native.find(L"\"lifecycle\"") != std::wstring::npos);
+        CHECK(native.find(L"\"hooks\"") != std::wstring::npos);
+        CHECK(native.find(L"\"crashDump\"") != std::wstring::npos);
         std::cout << "PASS: callback isolation, repeated install, original load chain, address reuse, null callbacks, ABI guard, hook capacity\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

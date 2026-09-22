@@ -17,7 +17,7 @@ function gitInfo(root = ROOT) {
 
 function sourceInfo(root = ROOT) {
     const files = ['VERSION', 'CMakeLists.txt', 'vcpkg.json', 'vcpkg-configuration.json',
-        'tools/build-info.cjs', 'tools/build-dll.ps1', 'scripts/clipboard_fix.js',
+        'tools/build-info.cjs', 'tools/build-environment.ps1', 'tools/build-dll.ps1', 'scripts/clipboard_fix.js',
         'scripts/userscript_boot.js', 'scripts/diagnostics.js'];
     function walk(dir) {
         for (const item of fs.readdirSync(path.join(root, dir), { withFileTypes: true })) {

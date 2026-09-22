@@ -1,8 +1,10 @@
-param([string]$BuildToolsPath = 'D:\Admin\VSBuildTools')
+param([string]$BuildToolsPath)
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path $PSScriptRoot -Parent
-$taskCmake = Join-Path $BuildToolsPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
-if (-not (Test-Path -LiteralPath $taskCmake)) { throw "CMake not found: $taskCmake" }
+. (Join-Path $PSScriptRoot 'build-environment.ps1')
+$taskEnvironment = Resolve-CefBuildEnvironment -BuildToolsPath $BuildToolsPath
+$taskCmake = $taskEnvironment.CMakePath
+$BuildToolsPath = $taskEnvironment.BuildToolsPath
 $taskDetours = @(
     (Join-Path $taskRoot 'vcpkg_installed\x86-windows'),
     (Join-Path $taskRoot 'out\build\x86-Release\vcpkg_installed\x86-windows')

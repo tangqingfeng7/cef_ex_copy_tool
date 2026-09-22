@@ -2,6 +2,8 @@
 #include "detours/detours.h"
 #include "clipboard_repair.h"
 #include "build_info.h"
+#include "crash_dump.h"
+#include "script_cache.h"
 #include "instance_hooks.h"
 #include "cef_frame_scope.h"
 #include <vector>
@@ -28,6 +30,93 @@ PVOID g_cef_browser_host_create_browser = nullptr;
 // The record is embedded in the DLL and read by the release verifier.
 static const wchar_t kBuildRecord[] = CEF_CX_BUILD_RECORD;
 static const size_t kBuildRecordPrefix = sizeof(L"CEF_CX_BUILD_INFO_V1:") / sizeof(wchar_t) - 1;
+
+enum NativeLifecycleState { LifecycleIdle, LifecycleStarting, LifecycleRunning,
+    LifecycleStopping, LifecycleStopped, LifecycleFailed };
+enum NativeHookState { HookPending, HookInstalling, HookInstalled, HookFailed };
+enum NativeHookPhase { HookPhaseNone, HookPhaseBegin, HookPhaseUpdateThread,
+    HookPhaseDisplayAffinity, HookPhaseKeyboardW, HookPhaseKeyboardA,
+    HookPhaseTopmost, HookPhaseCefString, HookPhaseCefBrowser, HookPhaseCommit };
+
+static volatile LONG g_lifecycleState = LifecycleIdle;
+static volatile LONG g_lifecycleError = 0;
+static volatile LONG g_stopRequested = 0;
+static volatile LONG g_hookState = HookPending;
+static volatile LONG g_hookPhase = HookPhaseNone;
+static volatile LONG g_hookError = 0;
+static HANDLE g_stopEvent = nullptr;
+static HANDLE g_workerThread = nullptr;
+
+static const wchar_t* LifecycleStateName(LONG state) {
+    switch (state) {
+    case LifecycleStarting: return L"starting";
+    case LifecycleRunning: return L"running";
+    case LifecycleStopping: return L"stopping";
+    case LifecycleStopped: return L"stopped";
+    case LifecycleFailed: return L"failed";
+    default: return L"idle";
+    }
+}
+
+static const wchar_t* HookStateName(LONG state) {
+    switch (state) {
+    case HookInstalling: return L"installing";
+    case HookInstalled: return L"installed";
+    case HookFailed: return L"failed";
+    default: return L"pending";
+    }
+}
+
+static const wchar_t* HookPhaseName(LONG phase) {
+    switch (phase) {
+    case HookPhaseBegin: return L"begin";
+    case HookPhaseUpdateThread: return L"update-thread";
+    case HookPhaseDisplayAffinity: return L"display-affinity";
+    case HookPhaseKeyboardW: return L"keyboard-w";
+    case HookPhaseKeyboardA: return L"keyboard-a";
+    case HookPhaseTopmost: return L"topmost";
+    case HookPhaseCefString: return L"cef-string";
+    case HookPhaseCefBrowser: return L"cef-browser";
+    case HookPhaseCommit: return L"commit";
+    default: return L"none";
+    }
+}
+
+static std::wstring JsonEscape(const std::wstring& input) {
+    std::wstring result;
+    result.reserve(input.size() + 8);
+    for (wchar_t ch : input) {
+        if (ch == L'\\' || ch == L'"') result += L'\\';
+        if (ch >= 0x20) result += ch;
+    }
+    return result;
+}
+
+static std::wstring HostProcessName() {
+    wchar_t path[32768] = {};
+    DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(_countof(path)));
+    if (!length || length >= _countof(path)) return L"unknown";
+    const wchar_t* name = wcsrchr(path, L'\\');
+    return name ? name + 1 : path;
+}
+
+static std::wstring NativeDiagnosticsJson() {
+    const LONG lifecycle = InterlockedCompareExchange(&g_lifecycleState, 0, 0);
+    const LONG lifecycleError = InterlockedCompareExchange(&g_lifecycleError, 0, 0);
+    const LONG hook = InterlockedCompareExchange(&g_hookState, 0, 0);
+    const LONG phase = InterlockedCompareExchange(&g_hookPhase, 0, 0);
+    const LONG hookError = InterlockedCompareExchange(&g_hookError, 0, 0);
+    const bool stopRequested = InterlockedCompareExchange(&g_stopRequested, 0, 0) != 0;
+    return L"{\"host\":{\"process\":\"" + JsonEscape(HostProcessName()) +
+        L"\",\"pid\":" + std::to_wstring(GetCurrentProcessId()) +
+        L",\"architecture\":\"x86\"},\"lifecycle\":{\"status\":\"" +
+        LifecycleStateName(lifecycle) + L"\",\"stopRequested\":" +
+        (stopRequested ? L"true" : L"false") + L",\"lastError\":" +
+        std::to_wstring(lifecycleError) + L"},\"hooks\":{\"status\":\"" +
+        HookStateName(hook) + L"\",\"phase\":\"" + HookPhaseName(phase) +
+        L"\",\"lastError\":" + std::to_wstring(hookError) +
+        L"},\"crashDump\":" + CrashDumpDiagnosticsJson() + L"}";
+}
 
 static std::wstring RuntimeVersionJson() {
     auto module = GetModuleHandleW(L"libcef.dll");
@@ -139,22 +228,17 @@ void RestoreTaskbar() {
 // 后台线程：先等待客户端启动稳定（完整性校验通过），再周期性卸载已记录的
 // 全局低级键盘钩子，取消考试窗口的置顶属性，并恢复被隐藏的任务栏。
 // 若客户端看门狗重新安装钩子/重新置顶/再次隐藏任务栏，会在下一轮被再次清除。
-DWORD WINAPI UnhookKeyboardThread(LPVOID) {
-    Sleep(8000);
-    for (;;) {
-        {
-            std::lock_guard<std::mutex> lock(g_keyboard_hooks_mutex);
-            for (auto it = g_keyboard_hooks.begin(); it != g_keyboard_hooks.end();) {
-                if (UnhookWindowsHookEx(*it) || GetLastError() == ERROR_INVALID_HOOK_HANDLE)
-                    it = g_keyboard_hooks.erase(it);
-                else ++it;
-            }
+static void MaintainWindowState() {
+    {
+        std::lock_guard<std::mutex> lock(g_keyboard_hooks_mutex);
+        for (auto it = g_keyboard_hooks.begin(); it != g_keyboard_hooks.end();) {
+            if (UnhookWindowsHookEx(*it) || GetLastError() == ERROR_INVALID_HOOK_HANDLE)
+                it = g_keyboard_hooks.erase(it);
+            else ++it;
         }
-        EnumWindows(DetopmostEnumProc, 0);
-        RestoreTaskbar();
-        Sleep(2000);
     }
-    return 0;
+    EnumWindows(DetopmostEnumProc, 0);
+    RestoreTaskbar();
 }
 
 void SetAsPopup(cef_window_info_t* window_info) {
@@ -210,45 +294,6 @@ static std::wstring GetExeDir() {
     return std::wstring(path);
 }
 
-// 以 UTF-8 读取文件并转换为宽字符串（用于注入 JS）。
-static bool ReadFileUtf8ToWString(const std::wstring& path, std::wstring& out) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-    LARGE_INTEGER size{};
-    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 ||
-        size.QuadPart >(LONGLONG)(64 * 1024 * 1024)) {
-        CloseHandle(h);
-        return false;
-    }
-    std::string buf;
-    buf.resize((size_t)size.QuadPart);
-    DWORD read = 0;
-    BOOL ok = ReadFile(h, &buf[0], (DWORD)buf.size(), &read, NULL);
-    CloseHandle(h);
-    if (!ok) {
-        return false;
-    }
-    buf.resize(read);
-    // 去掉可能存在的 UTF-8 BOM
-    if (buf.size() >= 3 && (unsigned char)buf[0] == 0xEF &&
-        (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF) {
-        buf.erase(0, 3);
-    }
-    if (buf.empty()) {
-        return false;
-    }
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), NULL, 0);
-    if (wlen <= 0) {
-        return false;
-    }
-    out.resize(wlen);
-    MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), &out[0], wlen);
-    return true;
-}
-
 // 执行一段 JS（单次 execute_java_script），并释放临时 cef_string，避免内存泄漏。
 static void ExecJs(struct _cef_frame_t* frame, const std::wstring& js) {
     if (!FrameCanExecute(frame) || !func_cef_string_from_ptr) return;
@@ -299,78 +344,50 @@ static std::wstring Base64EncodeUtf8(const std::wstring& wide) {
     return out;
 }
 
-// 分片注入超长脚本：将脚本 base64 后逐片追加（每片单独 execute_java_script，
-// 绕过单次注入的长度上限；base64 全是 ASCII，拼接不会被转义破坏），
-// 最后在页面里 atob 解码并 eval 执行。
-static void InjectScriptChunked(struct _cef_frame_t* frame,
-                                const std::wstring& label,
-                                const std::wstring& full) {
-    std::wstring b64 = Base64EncodeUtf8(full);
-    ExecJs(frame, L"window.__wnB='';");
-    const size_t CHUNK = 8000; // 每片字符数，远低于单次注入上限
-    for (size_t i = 0; i < b64.size(); i += CHUNK) {
-        ExecJs(frame, L"window.__wnB+=\"" + b64.substr(i, CHUNK) + L"\";");
-    }
-    // 解码后单独 eval；失败时尽量定位语法错误所在位置（按行列裁出附近代码）。
-    std::wstring js =
-        L"try{"
-        L"var __ws=decodeURIComponent(escape(atob(window.__wnB)));"
-        L"console.log('[CefHook] [" + label + L"] chars=',__ws.length);"
-        L"(0,eval)(__ws);"
-        L"console.log('[CefHook] [" + label + L"] eval OK');"
-        L"}catch(e){"
-        L"window.__cefUserScriptState={status:'failed',phase:'eval',reason:'eval-" + label + L"',attempts:0};"
-        L"console.error('[CefHook] [" + label + L"] eval FAIL:',e&&e.message);"
-        L"try{"
-        L"var m=String(e&&e.stack||'').match(/<anonymous>:(\\d+):(\\d+)/);"
-        L"if(m){var ln=+m[1],col=+m[2];var lines=__ws.split('\\n');"
-        L"console.error('[CefHook] [" + label + L"] at line',ln,'col',col,'=>',"
-        L"(lines[ln-1]||'').slice(Math.max(0,col-40),col+40));}"
-        L"else{console.error('[CefHook] [" + label + L"] head=',__ws.slice(0,200));}"
-        L"}catch(_){}"
-        L"}finally{window.__wnB='';}";
-    ExecJs(frame, js);
+// The cache stores the encoded wrapper too; repeat loads only inspect metadata.
+static std::wstring WrapUserScript(const std::wstring& mainScript) {
+    return L"window.__cefRunUserScript(function(){\nreturn (function($, jQuery){\n" + mainScript +
+        L"\n}).call(window, window.__wnJQ||window.$, window.__wnJQ||window.jQuery);\n});\n";
 }
 
-// 读取并注入外部油猴脚本：gm_shim.js（运行时垫片）+ dat.js（主脚本）。
+static void InjectScriptChunked(struct _cef_frame_t* frame,
+                                const std::wstring& file,
+                                const std::wstring& encoded) {
+    ExecJs(frame, L"window.__wnB='';");
+    const size_t CHUNK = 8000;
+    for (size_t i = 0; i < encoded.size(); i += CHUNK)
+        ExecJs(frame, L"if(window.__cefInjectionAllowed)window.__wnB+=\"" + encoded.substr(i, CHUNK) + L"\";");
+    ExecJs(frame, L"try{if(window.__cefInjectionAllowed){"
+        L"window.__cefEvaluateScript('" + file + L"',decodeURIComponent(escape(atob(window.__wnB))));"
+        L"}}catch(e){window.__cefReportUserScriptFailure('" + file + L"','decode','decode-error');}"
+        L"finally{window.__wnB='';}");
+}
+
 static void InjectUserScript(struct _cef_frame_t* frame) {
     if (!FrameCanExecute(frame)) return;
-    // 探针：确认注入回调确实触发（极小，必定能执行）
-    ExecJs(frame, L"window.__wnInject=(window.__wnInject||0)+1;"
-        L"console.log('[CefHook] inject fired',window.__wnInject);");
-
-    std::wstring dir = GetExeDir();
-    std::wstring shim, mainScript;
-    if (!ReadFileUtf8ToWString(dir + L"\\gm_shim.js", shim)) {
-        OutputDebugString(L"[CefHook] gm_shim.js not found, skip userscript\n");
-        ExecJs(frame, L"window.__cefUserScriptState={status:'skipped',reason:'shim-missing-or-unreadable'};"
-            L"console.warn('[CefHook] gm_shim.js 缺失或无法读取');");
-        return;
-    }
-    if (!ReadFileUtf8ToWString(dir + L"\\dat.js", mainScript)) {
-        OutputDebugString(L"[CefHook] dat.js not found, skip userscript\n");
-        ExecJs(frame, L"window.__cefUserScriptState={status:'skipped',reason:'dat-missing-or-unreadable'};"
-            L"console.warn('[CefHook] dat.js 缺失或无法读取');");
-        return;
-    }
-
-    // 先单独注入 gm_shim（定义 GM_* 与 __wnBootGM），再单独注入 dat.js，
-    // 这样语法错误能明确归属到具体脚本。
-    InjectScriptChunked(frame, L"shim", shim);
     ExecJs(frame, kUserScriptBootScript);
-
-    std::wstring datWrapped;
-    datWrapped.reserve(mainScript.size() + 512);
-    // State is set to ready only after boot and entry execution succeed.
-    // 在闭包里把 $/jQuery 绑定到我们隔离出来的 __wnJQ，避免使用（并覆盖）页面的 jQuery。
-    datWrapped += L"window.__cefRunUserScript(function(){\nreturn (function($, jQuery){\n";
-    datWrapped += mainScript;
-    datWrapped += L"\n}).call(window, window.__wnJQ||window.$, window.__wnJQ||window.jQuery);\n";
-    datWrapped += L"\n});\n";
-    InjectScriptChunked(frame, L"dat", datWrapped);
-
-    OutputDebugString(L"[CefHook] userscript injected (chunked)\n");
+    ExecJs(frame, L"window.__cefInjectionAllowed=window.__cefBeginUserScriptInjection();");
+    static ScriptFileCache shimCache(Base64EncodeUtf8);
+    static ScriptFileCache datCache([](const std::wstring& source) {
+        return Base64EncodeUtf8(WrapUserScript(source));
+    });
+    const std::wstring dir = GetExeDir();
+    auto shim = shimCache.load(dir + L"\\gm_shim.js");
+    if (!shim) {
+        ExecJs(frame, L"if(window.__cefInjectionAllowed)window.__cefReportUserScriptFailure("
+            L"'gm_shim.js','read','missing-or-unreadable');");
+        return;
+    }
+    auto dat = datCache.load(dir + L"\\dat.js");
+    if (!dat) {
+        ExecJs(frame, L"if(window.__cefInjectionAllowed)window.__cefReportUserScriptFailure("
+            L"'dat.js','read','missing-or-unreadable');");
+        return;
+    }
+    InjectScriptChunked(frame, L"gm_shim.js", *shim);
+    InjectScriptChunked(frame, L"dat.js", *dat);
 }
+
 #endif
 
 // One embedded event layer handles clipboard and text selection in every frame.
@@ -379,7 +396,8 @@ static void InjectCrackShim(struct _cef_frame_t* frame) {
     cef_string_t code{};
     cef_string_t url{};
     std::wstring script = L"window.__cefBuildInfo=" + std::wstring(kBuildRecord + kBuildRecordPrefix) +
-        L";window.__cefRuntimeInfo=" + RuntimeVersionJson() + L";\n";
+        L";window.__cefRuntimeInfo=" + RuntimeVersionJson() +
+        L";window.__cefNativeInfo=" + NativeDiagnosticsJson() + L";\n";
 #if !ENABLE_USERSCRIPT
     script += L"window.__cefUserScriptState={status:'disabled',reason:'build-option'};\n";
 #else
@@ -460,12 +478,33 @@ int hook_cef_browser_host_create_browser(
 }
 
 BOOL APIENTRY InstallHook() {
-    if (DetourTransactionBegin() != NO_ERROR) return FALSE;
-    if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR) {
+    InterlockedExchange(&g_hookState, HookInstalling);
+    InterlockedExchange(&g_hookPhase, HookPhaseBegin);
+    LONG result = DetourTransactionBegin();
+    if (result != NO_ERROR) {
+        InterlockedExchange(&g_hookError, result);
+        InterlockedExchange(&g_hookState, HookFailed);
+        return FALSE;
+    }
+    InterlockedExchange(&g_hookPhase, HookPhaseUpdateThread);
+    result = DetourUpdateThread(GetCurrentThread());
+    if (result != NO_ERROR) {
+        InterlockedExchange(&g_hookError, result);
+        InterlockedExchange(&g_hookState, HookFailed);
         DetourTransactionAbort(); return FALSE;
     }
-    auto attach = [](PVOID* original, PVOID hook) {
-        if (*original && DetourAttach(original, hook) == NO_ERROR) return true;
+    auto attach = [](PVOID* original, PVOID hook, NativeHookPhase phase) {
+        InterlockedExchange(&g_hookPhase, phase);
+        if (!*original) {
+            InterlockedExchange(&g_hookError, ERROR_PROC_NOT_FOUND);
+            InterlockedExchange(&g_hookState, HookFailed);
+            DetourTransactionAbort();
+            return false;
+        }
+        LONG error = DetourAttach(original, hook);
+        if (error == NO_ERROR) return true;
+        InterlockedExchange(&g_hookError, error);
+        InterlockedExchange(&g_hookState, HookFailed);
         OutputDebugString(L"[CefHook] hook target missing or attach failed; aborting transaction\n");
         DetourTransactionAbort();
         return false;
@@ -478,38 +517,65 @@ BOOL APIENTRY InstallHook() {
     // Hook SetWindowDisplayAffinity
     g_set_window_display_affinity =
         DetourFindFunction("user32.dll", "SetWindowDisplayAffinity");
-    if (!attach(&g_set_window_display_affinity, (PVOID)hook_set_window_display_affinity)) return FALSE;
+    if (!attach(&g_set_window_display_affinity, (PVOID)hook_set_window_display_affinity,
+            HookPhaseDisplayAffinity)) return FALSE;
 
 #if ENABLE_UNBLOCK_SWITCH
     // Hook SetWindowsHookEx 以解除客户端对 Win+Tab / Alt+Tab 等切屏按键的封锁
     g_set_windows_hook_ex_w =
         DetourFindFunction("user32.dll", "SetWindowsHookExW");
-    if (!attach(&g_set_windows_hook_ex_w, (PVOID)hook_set_windows_hook_ex_w)) return FALSE;
+    if (!attach(&g_set_windows_hook_ex_w, (PVOID)hook_set_windows_hook_ex_w,
+            HookPhaseKeyboardW)) return FALSE;
 
     g_set_windows_hook_ex_a =
         DetourFindFunction("user32.dll", "SetWindowsHookExA");
-    if (!attach(&g_set_windows_hook_ex_a, (PVOID)hook_set_windows_hook_ex_a)) return FALSE;
+    if (!attach(&g_set_windows_hook_ex_a, (PVOID)hook_set_windows_hook_ex_a,
+            HookPhaseKeyboardA)) return FALSE;
 
     // Hook SetWindowPos 以阻止考试窗口强制置顶
     g_set_window_pos =
         DetourFindFunction("user32.dll", "SetWindowPos");
-    if (!attach(&g_set_window_pos, (PVOID)hook_set_window_pos)) return FALSE;
+    if (!attach(&g_set_window_pos, (PVOID)hook_set_window_pos,
+            HookPhaseTopmost)) return FALSE;
 #endif
 
+    InterlockedExchange(&g_hookPhase, HookPhaseCefString);
 #ifdef UNICODE
     func_cef_string_from_ptr = reinterpret_cast<cef_string_from_ptr_t>(DetourFindFunction("libcef.dll", "cef_string_wide_to_utf16"));
 #else
     func_cef_string_from_ptr = reinterpret_cast<cef_string_from_ptr_t>(DetourFindFunction("libcef.dll", "cef_string_ascii_to_utf16"));
 #endif
 
-    if (!func_cef_string_from_ptr) { DetourTransactionAbort(); return FALSE; }
-    if (!attach(&g_cef_browser_host_create_browser, (PVOID)hook_cef_browser_host_create_browser)) return FALSE;
+    if (!func_cef_string_from_ptr) {
+        InterlockedExchange(&g_hookError, ERROR_PROC_NOT_FOUND);
+        InterlockedExchange(&g_hookState, HookFailed);
+        DetourTransactionAbort(); return FALSE;
+    }
+    if (!attach(&g_cef_browser_host_create_browser, (PVOID)hook_cef_browser_host_create_browser,
+            HookPhaseCefBrowser)) return FALSE;
 
-    return DetourTransactionCommit() == NO_ERROR;
+    InterlockedExchange(&g_hookPhase, HookPhaseCommit);
+    result = DetourTransactionCommit();
+    if (result != NO_ERROR) {
+        InterlockedExchange(&g_hookError, result);
+        InterlockedExchange(&g_hookState, HookFailed);
+        return FALSE;
+    }
+    InterlockedExchange(&g_hookError, 0);
+    InterlockedExchange(&g_hookState, HookInstalled);
+    return TRUE;
 }
 
 DWORD WINAPI ThreadProc(LPVOID lpThreadParameter)
 {
+    (void)lpThreadParameter;
+    HMODULE pinnedModule = nullptr;
+    LPCWSTR moduleAddress = reinterpret_cast<LPCWSTR>(const_cast<LONG*>(&g_lifecycleState));
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            moduleAddress, &pinnedModule)) {
+        InterlockedExchange(&g_lifecycleError, static_cast<LONG>(GetLastError()));
+    }
+    InstallCrashDumpHandler();
     OutputDebugStringW(L"[CefHook] " CEF_CX_BUILD_RECORD L"\n");
     OutputDebugStringW((L"[CefHook] runtime " + RuntimeVersionJson() + L"\n").c_str());
 #if ENABLE_MEMORY_PATCH
@@ -527,18 +593,51 @@ DWORD WINAPI ThreadProc(LPVOID lpThreadParameter)
 #endif
 
     if (!InstallHook()) {
-        OutputDebugString(TEXT("[CefHook] Hook Failed"));
+        const LONG phase = InterlockedCompareExchange(&g_hookPhase, 0, 0);
+        const LONG error = InterlockedCompareExchange(&g_hookError, 0, 0);
+        OutputDebugStringW((L"[CefHook] hook failed phase=" + std::wstring(HookPhaseName(phase)) +
+            L" error=" + std::to_wstring(error) + L"\n").c_str());
+        InterlockedExchange(&g_lifecycleState, LifecycleFailed);
         return 1;
     }
     OutputDebugString(TEXT("[CefHook] Hook Success"));
+    InterlockedExchange(&g_lifecycleState, LifecycleRunning);
 
 #if ENABLE_UNBLOCK_SWITCH
-    // 启动后台线程，延迟卸载客户端的全局键盘钩子以放行 Win+Tab / Alt+Tab
-    HANDLE hUnhookThread = CreateThread(NULL, 0, UnhookKeyboardThread, NULL, 0, NULL);
-    if (hUnhookThread) {
-        CloseHandle(hUnhookThread);
+    DWORD wait = WaitForSingleObject(g_stopEvent, 8000);
+    while (wait == WAIT_TIMEOUT) {
+        MaintainWindowState();
+        wait = WaitForSingleObject(g_stopEvent, 2000);
     }
+#else
+    WaitForSingleObject(g_stopEvent, INFINITE);
 #endif
-
+    InterlockedExchange(&g_lifecycleState, LifecycleStopping);
+    InterlockedExchange(&g_lifecycleState, LifecycleStopped);
     return 0;
+}
+
+BOOL StartCefHookWorker() {
+    if (InterlockedCompareExchange(&g_lifecycleState, LifecycleStarting, LifecycleIdle) != LifecycleIdle)
+        return g_workerThread != nullptr;
+    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_stopEvent) {
+        InterlockedExchange(&g_lifecycleError, static_cast<LONG>(GetLastError()));
+        InterlockedExchange(&g_lifecycleState, LifecycleFailed);
+        return FALSE;
+    }
+    g_workerThread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
+    if (!g_workerThread) {
+        InterlockedExchange(&g_lifecycleError, static_cast<LONG>(GetLastError()));
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+        InterlockedExchange(&g_lifecycleState, LifecycleFailed);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void SignalCefHookShutdown() {
+    InterlockedExchange(&g_stopRequested, 1);
+    if (g_stopEvent) SetEvent(g_stopEvent);
 }
