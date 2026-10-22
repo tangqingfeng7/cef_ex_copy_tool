@@ -256,6 +256,7 @@ void SetAsPopup(cef_window_info_t* window_info) {
 }
 
 static bool ToggleDeepSeekPanel(struct _cef_browser_t* browser);
+static bool ToggleDeepSeekAnswering(struct _cef_browser_t* browser);
 
 // Intercept before renderer dispatch: works while a child editor iframe owns
 // focus and prevents native + DOM handlers from toggling the panel twice.
@@ -265,9 +266,11 @@ int CEF_CALLBACK hook_cef_on_pre_key_event(
     int* is_keyboard_shortcut) {
     if (event && event->type == KEYEVENT_RAWKEYDOWN && event->windows_key_code == 'G'
         && (event->modifiers & EVENTFLAG_CONTROL_DOWN)
-        && !(event->modifiers & (EVENTFLAG_ALT_DOWN | EVENTFLAG_SHIFT_DOWN | EVENTFLAG_COMMAND_DOWN))) {
+        && !(event->modifiers & (EVENTFLAG_ALT_DOWN | EVENTFLAG_COMMAND_DOWN))) {
         // Windows lParam bit 30 marks an auto-repeat, not another press.
-        if ((static_cast<unsigned int>(event->native_key_code) & (1u << 30)) || ToggleDeepSeekPanel(browser)) {
+        const bool pauseShortcut = (event->modifiers & EVENTFLAG_SHIFT_DOWN) != 0;
+        if ((static_cast<unsigned int>(event->native_key_code) & (1u << 30)) ||
+            (pauseShortcut ? ToggleDeepSeekAnswering(browser) : ToggleDeepSeekPanel(browser))) {
             if (is_keyboard_shortcut) *is_keyboard_shortcut = 1;
             return 1;
         }
@@ -364,6 +367,16 @@ static bool ToggleDeepSeekPanel(struct _cef_browser_t* browser) {
     if (!frame) return false;
     const bool ready = FrameCanExecute(frame);
     if (ready) ExecJs(frame, L"if(window.__cefDeepSeek&&window.__cefDeepSeek.toggleSettings)window.__cefDeepSeek.toggleSettings();", L"cef-cx/ai-hotkey.js");
+    if (frame->base.release) frame->base.release(&frame->base);
+    return ready;
+}
+
+static bool ToggleDeepSeekAnswering(struct _cef_browser_t* browser) {
+    if (!browser || !browser->get_main_frame || !func_cef_string_from_ptr) return false;
+    auto* frame = browser->get_main_frame(browser);
+    if (!frame) return false;
+    const bool ready = FrameCanExecute(frame);
+    if (ready) ExecJs(frame, L"if(window.__cxUpstreamAI&&window.__cxUpstreamAI.togglePause)window.__cxUpstreamAI.togglePause();", L"cef-cx/ai-pause-hotkey.js");
     if (frame->base.release) frame->base.release(&frame->base);
     return ready;
 }

@@ -106,6 +106,9 @@ int main() {
         CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 1);
         CHECK(scripts == beforeShortcut + 1); // Holding Ctrl+G never flickers.
         event.native_key_code = 0; event.modifiers |= EVENTFLAG_SHIFT_DOWN;
+        CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 1);
+        CHECK(scripts == beforeShortcut + 2 && injected.back().find(L"togglePause()") != std::wstring::npos);
+        event.modifiers = EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN;
         CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 7);
         event.modifiers = EVENTFLAG_CONTROL_DOWN;
         CHECK(keys.on_pre_key_event(&keys, nullptr, &event, nullptr, &shortcut) == 7);
@@ -113,7 +116,7 @@ int main() {
         CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 7);
         CHECK(frameRefs == 1 && preKeyCalls == 3);
         detached = false; captureScripts = false; injected.clear(); shortcutFrame = nullptr;
-        std::cout << "PASS: native Ctrl+G targets main frame, consumes once before DOM, ignores repeat and preserves original callbacks/refcounts\n";
+        std::cout << "PASS: native Ctrl+G panel and Ctrl+Shift+G pause target main frame, consume once before DOM, ignore repeat and preserve original callbacks/refcounts\n";
         keys.base.release(&keys.base);
         loadA.base.release(&loadA.base); loadB.base.release(&loadB.base);
         clientA.base.release(&clientA.base); clientB.base.release(&clientB.base);

@@ -13,7 +13,8 @@ click-to-fill, middle-click batch fill, question types and DOM selectors.
 
 Local adaptations: persistent DLL-adjacent config and Ctrl+G popup/opacity, bounded
 multimodal vision requests using deepseek-flash, images from question/option DOM,
-strict request-fill-next sequential answering, contextual chat with clipboard-image
+strict request-delay-fill-next sequential answering, pause/resume controls,
+backup-clear-write-verify rich-editor replacement, contextual chat with clipboard-image
 paste, safe text insertion, stale-result checks, removal of destructive answer cleanup
 and private console logging. Missing/ambiguous multi-blank mapping is left for
 manual review instead of copying one answer to every blank. The existing legacy

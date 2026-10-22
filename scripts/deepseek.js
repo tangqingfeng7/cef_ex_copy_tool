@@ -19,6 +19,8 @@
             mode: input.mode === 'ai-first' || input.mode === 'legacy' ? input.mode : 'ai-only',
             timeoutMs: bounded(input.timeoutMs, 90000, 5000, 180000),
             concurrency: bounded(input.concurrency, 1, 1, 2),
+            answerDelayMs: bounded(input.answerDelayMs, 1000, 0, 10000),
+            overwritePolicy: input.overwritePolicy === 'empty-only' || input.overwritePolicy === 'ask' ? input.overwritePolicy : 'always',
             maxImages: bounded(input.maxImages, 6, 1, 12),
             imageMaxEdge: bounded(input.imageMaxEdge, 2048, 512, 4096)
         };
@@ -40,7 +42,7 @@
         return /\/chat\/completions$/.test(base) ? base : base + '/chat/completions';
     }
     function safeStatus() {
-        return { enabled: enabled(), configured: !!cfg.apiKey, model: cfg.model, mode: cfg.mode,
+        return { enabled: enabled(), configured: !!cfg.apiKey, model: cfg.model, mode: cfg.mode, answerDelayMs: cfg.answerDelayMs, overwritePolicy: cfg.overwritePolicy,
             active: running, queued: queue.length, requests: stats.requests, probeRequests: stats.probeRequests, cacheHits: stats.cacheHits,
             status: stats.status, lastCode: stats.lastCode, images: stats.images, transport: stats.transport };
     }
@@ -581,6 +583,22 @@
         if (priorFocus && priorFocus.isConnected && priorFocus.focus) { try { priorFocus.focus({ preventScroll: true }); } catch (_) {} }
     }
     function toggleSettings() { if (panelVisible()) hideSettings(); else openSettings(); }
+    function answeringPaused() {
+        return !!(w.__cxUpstreamAI && w.__cxUpstreamAI.isPaused && w.__cxUpstreamAI.isPaused());
+    }
+    function updatePauseControl(paused) {
+        if (!dialog) return;
+        var button = dialog.panel.getElementById('pause');
+        if (!button) return;
+        button.textContent = (paused ? '继续答题' : '暂停答题') + ' · Ctrl+Shift+G';
+        button.setAttribute('data-paused', String(!!paused));
+    }
+    function toggleAnswering() {
+        if (!w.__cxUpstreamAI || !w.__cxUpstreamAI.togglePause) {
+            reportStatus('答题模块尚未就绪，请等待页面加载', 'error'); return false;
+        }
+        var paused = w.__cxUpstreamAI.togglePause(); updatePauseControl(paused); return paused;
+    }
     function openSettings() {
         if (!doc || !doc.body) return;
         if (panelVisible()) return;
@@ -591,6 +609,9 @@
             dialog.panel.getElementById('base').value = cfg.baseUrl;
             dialog.panel.getElementById('model').value = cfg.model;
             dialog.panel.getElementById('mode').value = cfg.mode;
+            dialog.panel.getElementById('answerDelay').value = String(cfg.answerDelayMs / 1000);
+            dialog.panel.getElementById('overwritePolicy').value = cfg.overwritePolicy;
+            updatePauseControl(answeringPaused());
             var old = dialog.host.getBoundingClientRect(); movePanel(old.left, old.top);
             dialog.panel.getElementById('dismiss').focus({ preventScroll: true }); return;
         }
@@ -601,7 +622,7 @@
             ':host{font:13px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;color:#20242b}*{box-sizing:border-box}section{height:100%;background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 8px 28px rgba(15,23,42,.14);display:flex;flex-direction:column;overflow:hidden}' +
             'header{height:48px;padding:0 16px;display:flex;align-items:center;justify-content:space-between;cursor:move;touch-action:none;user-select:none;flex-shrink:0}header strong{font-size:14px;font-weight:600;letter-spacing:.1px}.badge{font-size:11px;color:#94a3b8;margin-left:8px;font-weight:400}' +
             'button,input,select{font:inherit;outline:none}button{appearance:none;-webkit-appearance:none;border:1px solid #e2e8f0;border-radius:7px;background:#fff;color:#475569;padding:7px 12px;cursor:pointer;line-height:1.4}button:hover{background:#f8fafc}button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid #93c5fd;outline-offset:2px}button:disabled{opacity:.55;cursor:wait}#dismiss{border:0;background:transparent;color:#94a3b8;font-size:20px;padding:0;width:24px;height:28px}.content{flex:1;min-height:0;overflow:auto;padding:0 16px 12px}' +
-            '.content::-webkit-scrollbar{width:4px}.content::-webkit-scrollbar-thumb{background:#dbe1e8;border-radius:4px}.row{display:flex;align-items:center;justify-content:space-between}.enable-row{margin:0 0 16px}.muted{font-size:11px;color:#94a3b8}.field{display:block;margin:0 0 12px;color:#64748b;font-size:12px}.control{display:block;width:100%;height:36px;margin-top:6px;padding:7px 10px;border:1px solid #e2e8f0;border-radius:7px;background:#fff;color:#334155;appearance:none;-webkit-appearance:none}.control:focus{border-color:#93b5f5;box-shadow:0 0 0 2px #eff6ff}.control::placeholder{color:#a1aab6;font-size:12px}' +
+            '.content::-webkit-scrollbar{width:4px}.content::-webkit-scrollbar-thumb{background:#dbe1e8;border-radius:4px}.row{display:flex;align-items:center;justify-content:space-between}.enable-row{margin:0 0 16px}.muted{font-size:11px;color:#94a3b8}.field{display:block;margin:0 0 12px;color:#64748b;font-size:12px}.control{display:block;width:100%;height:36px;margin-top:6px;padding:7px 10px;border:1px solid #e2e8f0;border-radius:7px;background:#fff;color:#334155;appearance:none;-webkit-appearance:none}.control:focus{border-color:#93b5f5;box-shadow:0 0 0 2px #eff6ff}.control::placeholder{color:#a1aab6;font-size:12px}.answer-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 12px}.answer-setting{display:block;color:#64748b;font-size:11px}.delay-control{height:36px;margin-top:6px;padding:0 9px;display:flex;align-items:center;border:1px solid #e2e8f0;border-radius:7px;background:#fff}.delay-control:focus-within{border-color:#93b5f5;box-shadow:0 0 0 2px #eff6ff}.delay-control input{min-width:0;width:100%;border:0;padding:0;background:transparent;color:#334155}.delay-control em{font-style:normal;color:#94a3b8}.answer-setting #pause{width:100%;height:36px;margin-top:6px;padding:6px 8px}#pause[data-paused=true]{background:#ecfdf5;border-color:#86d7ba;color:#13795b}' +
             '#enabled{appearance:none;-webkit-appearance:none;width:30px;height:18px;margin:0;border:0;border-radius:20px;background:#cbd5e1;position:relative;cursor:pointer;vertical-align:middle}#enabled:before{content:"";position:absolute;left:2px;top:2px;width:14px;height:14px;background:#fff;border-radius:50%;box-shadow:0 1px 3px #0002}#enabled:checked{background:#3b82f6}#enabled:checked:before{left:14px}.actions{display:flex;margin:4px 0 12px}.actions button{flex:1}.actions button+button{margin-left:8px}#save{background:#3379ed;border-color:#3379ed;color:#fff}#save:hover{background:#2867d2}' +
             '.tools{display:flex;align-items:center;margin-bottom:8px}.tools button{font-size:12px;padding:0;border:0;color:#64748b;background:transparent}.tools span{margin-left:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}details{border-top:1px solid #f1f5f9;margin-top:8px;padding-top:8px}summary{cursor:pointer;color:#64748b;font-size:12px;list-style:none}summary::-webkit-details-marker{display:none}summary:after{content:"›";float:right;color:#94a3b8}details[open] summary{margin-bottom:12px}details[open] summary:after{content:"⌄"}.secondary-actions{display:flex;justify-content:space-between}.secondary-actions button{border:0;background:transparent;padding:2px 0;font-size:12px;color:#64748b}#clear{color:#b55b60}.note{font-size:11px;color:#94a3b8;margin:8px 0 0;line-height:1.6}#status{font-size:12px;line-height:1.5;color:#64748b;margin:10px 0 0;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word}#status[data-state=error]{color:#c05050}#status[data-state=success]{color:#23866a}.progress{margin-top:12px;border-top:1px solid #f1f5f9;padding-top:9px}.progress-title{font-size:12px;color:#64748b;margin-bottom:6px}.progress table{width:100%;border-collapse:collapse;table-layout:fixed;font-size:11px}.progress th,.progress td{text-align:left;vertical-align:top;padding:6px 4px;border-bottom:1px solid #f1f5f9;word-break:break-word}.progress th:first-child,.progress td:first-child{width:28px}.progress th:last-child,.progress td:last-child{width:94px}.progress tr[data-state=pending] td:last-child{color:#64748b}.progress tr[data-state=success] td:last-child{color:#23866a}.progress tr[data-state=review] td:last-child{color:#b7791f}.progress tr[data-state=error] td:last-child{color:#c05050}' +
             '.tabs{display:flex;gap:6px;margin-bottom:14px;padding:3px;background:#f3f6fa;border-radius:9px}.tabs button{flex:1;border:0;padding:6px;background:transparent}.tabs button[data-active=true]{background:#fff;color:#2563eb;box-shadow:0 1px 4px #0f172a12}.pane[hidden]{display:none!important}.chat-log{height:265px;overflow:auto;padding:4px 0 8px}.chat-message{max-width:88%;margin:7px 0;padding:8px 10px;border-radius:10px;white-space:pre-wrap;word-break:break-word;background:#f1f5f9;color:#334155}.chat-message.user{margin-left:auto;background:#eaf2ff}.chat-message.assistant{margin-right:auto}.chat-images{display:flex;gap:5px;flex-wrap:wrap;margin:4px 0 7px}.chat-images span{font-size:11px;padding:3px 6px;border-radius:12px;background:#eef2f7;color:#64748b}.chat-images button{border:0;background:transparent;padding:0;color:#94a3b8}.chat-compose textarea{width:100%;height:64px;resize:none;border:1px solid #e2e8f0;border-radius:8px;padding:8px;color:#334155}.chat-actions{display:flex;justify-content:space-between;margin-top:7px}.chat-actions #chatSend{background:#3379ed;border-color:#3379ed;color:#fff}.paste-hint{font-size:11px;color:#94a3b8;margin-top:5px}' +
@@ -609,12 +630,15 @@
             '<section role="dialog" aria-label="DeepSeek 图文设置" aria-modal="false"><header id="titlebar"><strong>DeepSeek<span class="badge">图文</span></strong><button id="dismiss" aria-label="关闭面板" title="关闭 (Ctrl+G)">×</button></header><div class="content"><nav class="tabs"><button id="tabAnswer" data-active="true">答题</button><button id="tabChat">对话</button></nav><div id="answerPane" class="pane">' +
             '<label class="row enable-row"><span>启用 AI</span><input id="enabled" type="checkbox" aria-label="启用 AI"></label><label class="field">API Key<input class="control" id="key" type="password" autocomplete="off" placeholder="输入 Key，留空保留已配置值"></label><p class="note" style="margin:-6px 0 12px">保存在 DLL 同目录 config.json · API 调用可能收费</p>' +
             '<div class="actions"><button id="save">保存</button><button id="test" title="独立测试连接，可能产生少量 API 费用；不保存设置或获取题目">测试连接</button></div>' +
-            '<details id="advanced"><summary>更多设置</summary><label class="field">模型<input class="control" id="model" spellcheck="false"></label><label class="field">API 地址<input class="control" id="base" spellcheck="false"></label><label class="field">模式<select class="control" id="mode"><option value="ai-only">仅 DeepSeek</option><option value="ai-first">失败回题库（兼容路径）</option><option value="legacy">原题库</option></select></label>' +
+            '<div class="answer-controls"><label class="answer-setting"><span>逐题间隔</span><span class="delay-control"><input id="answerDelay" type="number" min="0" max="10" step="0.1" inputmode="decimal" aria-label="逐题间隔秒数"><em>秒</em></span></label><label class="answer-setting"><span>答题控制</span><button id="pause" type="button">暂停 · Ctrl+Shift+G</button></label></div>' +
+            '<details id="advanced"><summary>更多设置</summary><label class="field">覆盖策略<select class="control" id="overwritePolicy"><option value="always">总是覆盖</option><option value="empty-only">仅空白时填写</option><option value="ask">已有内容则询问</option></select></label><label class="field">模型<input class="control" id="model" spellcheck="false"></label><label class="field">API 地址<input class="control" id="base" spellcheck="false"></label><label class="field">模式<select class="control" id="mode"><option value="ai-only">仅 DeepSeek</option><option value="ai-first">失败回题库（兼容路径）</option><option value="legacy">原题库</option></select></label>' +
             '<div class="secondary-actions"><button id="retry">清除缓存 / 重试</button><button id="clear">清除 Key</button></div><p class="note">保存后 Key 会明文写入本机 config.json。启用后严格逐题请求、逐题填入；题目与图片会发送至配置的 API。测试不验证识图准确率。</p></details><p id="status" role="status"></p><div id="progressWrap" class="progress" hidden><div class="progress-title">答题过程</div><table><thead><tr><th>题号</th><th>问题</th><th>答案</th></tr></thead><tbody id="progressBody"></tbody></table></div></div>' +
             '<div id="chatPane" class="pane" hidden><div id="chatLog" class="chat-log" aria-live="polite"></div><div id="chatImages" class="chat-images" hidden></div><div class="chat-compose"><textarea id="chatInput" placeholder="输入消息；Ctrl+V 可直接粘贴剪贴板图片"></textarea><div class="paste-hint">支持上下文 · 剪贴板图片直接粘贴</div><div class="chat-actions"><button id="chatClear">清空对话</button><button id="chatSend">发送</button></div></div></div></div>' +
-            '<footer><div class="row"><span title="Ctrl+滚轮调整；右键20%/50%切换">不透明度 <span id="opacityLabel">50%</span></span><span>Ctrl+G 隐藏</span></div><input id="opacity" type="range" aria-label="不透明度" min="10" max="100" step="10" value="50"></footer></section>';
+            '<footer><div class="row"><span title="Ctrl+滚轮调整；右键20%/50%切换">不透明度 <span id="opacityLabel">50%</span></span><span>Ctrl+G 隐藏</span></div><div class="muted">Ctrl+Shift+G 暂停 / 继续答题</div><input id="opacity" type="range" aria-label="不透明度" min="10" max="100" step="10" value="50"></footer></section>';
         function field(id) { return panel.getElementById(id); }
         field('enabled').checked = cfg.enabled; field('base').value = cfg.baseUrl; field('model').value = cfg.model; field('mode').value = cfg.mode;
+        field('answerDelay').value = String(cfg.answerDelayMs / 1000);
+        field('overwritePolicy').value = cfg.overwritePolicy;
         dialog = { host: host, panel: panel, status: field('status') };
         function switchPane(name) {
             var chatPane = name === 'chat';
@@ -642,14 +666,15 @@
         field('dismiss').onclick = hideSettings;
         function showStatus(message, state) { reportStatus(message, state); }
         function draft() {
-            var next = Object.assign({}, cfg, { enabled: field('enabled').checked, baseUrl: field('base').value, model: field('model').value, mode: field('mode').value });
+            var next = Object.assign({}, cfg, { enabled: field('enabled').checked, baseUrl: field('base').value, model: field('model').value,
+                mode: field('mode').value, answerDelayMs: Number(field('answerDelay').value) * 1000, overwritePolicy: field('overwritePolicy').value });
             if (field('key').value) next.apiKey = field('key').value;
             return next;
         }
         async function apply() {
             var next = await persistConfig(draft()); configure(next); field('key').value = '';
             field('key').placeholder = cfg.apiKey ? '已配置，留空保留当前 Key' : '输入 Key，留空保留已配置值';
-            showStatus(enabled() && cfg.apiKey ? '已保存到 config.json · 正在逐题识别…' : '已保存到 config.json' + (cfg.apiKey ? '' : ' · 尚未配置 Key'), 'success');
+            showStatus(enabled() && cfg.apiKey ? `已保存 · 每题填入后间隔 ${cfg.answerDelayMs / 1000} 秒` : '已保存到 config.json' + (cfg.apiKey ? '' : ' · 尚未配置 Key'), 'success');
         }
         field('save').onclick = async function () {
             if (field('save').disabled) return;
@@ -664,6 +689,7 @@
             catch (e) { showStatus(e.message || '连接测试失败', 'error'); }
             finally { field('test').disabled = false; field('test').textContent = '测试连接'; }
         };
+        field('pause').onclick = toggleAnswering;
         field('retry').onclick = function () { clear('用户重试'); clearProgress(); stats.status = enabled() ? 'idle' : 'disabled'; stats.lastCode = null; showStatus('缓存已清除，可按鼠标中键重新答题'); };
         field('clear').onclick = async function () {
             try {
@@ -681,7 +707,8 @@
         doc.body.appendChild(host); setOpacity(panelOpacity); movePanel(0, 380);
         field('dismiss').focus({ preventScroll: true });
         field('key').placeholder = cfg.apiKey ? '已配置，留空保留当前 Key' : '输入 Key，留空保留已配置值';
-        renderProgress(); renderChat(); showStatus(lastStatus.message || (stats.lastCode ? '上次状态：' + stats.lastCode : ''), lastStatus.state);
+        renderProgress(); renderChat(); updatePauseControl(answeringPaused());
+        showStatus(lastStatus.message || (stats.lastCode ? '上次状态：' + stats.lastCode : ''), lastStatus.state);
     }
     w.__cefDeepSeek = { enabled: enabled, mode: function () { return cfg.mode; }, configure: configure, persistConfig: persistConfig, answer: answer,
         requestText: requestText, chat: chat, testConnection: testConnection,
@@ -690,10 +717,12 @@
     stats.status = enabled() ? 'idle' : 'disabled';
     if (doc && doc.addEventListener) {
         doc.addEventListener('keydown', function (e) {
-            if (e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey && (e.code === 'KeyG' || String(e.key).toLowerCase() === 'g')) {
-                e.preventDefault(); e.stopImmediatePropagation(); if (!e.repeat) toggleSettings();
+            if (e.ctrlKey && !e.altKey && !e.metaKey && (e.code === 'KeyG' || String(e.key).toLowerCase() === 'g')) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                if (!e.repeat) { if (e.shiftKey) toggleAnswering(); else toggleSettings(); }
             } else if (e.key === 'Escape' && panelVisible()) { e.preventDefault(); e.stopPropagation(); hideSettings(); }
         }, true);
+        doc.addEventListener('cef-ai-pause-changed', function (e) { updatePauseControl(!!(e.detail && e.detail.paused)); });
         doc.addEventListener('mousedown', function (e) { var root = closestQuestion(e.target); if (root) chosenRoot = root; }, true);
         w.addEventListener('pagehide', function () { clear('页面已离开'); });
         w.addEventListener('resize', function () { if (panelVisible()) { var rect = dialog.host.getBoundingClientRect(); movePanel(rect.left, rect.top); } });

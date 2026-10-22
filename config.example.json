@@ -6,6 +6,8 @@
   "model": "deepseek-flash",
   "timeoutMs": 90000,
   "concurrency": 1,
+  "answerDelayMs": 1000,
+  "overwritePolicy": "always",
   "maxImages": 6,
   "imageMaxEdge": 2048
 }
