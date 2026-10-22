@@ -7,7 +7,7 @@
  * 注意：
  *  - GM_xmlhttpRequest 目前用 fetch 直连实现，依赖目标后端允许跨域(CORS)。
  *    若搜题请求报跨域错误，需要改用其它方案（见 README）。
- *  - @require / @resource 走 CDN，需要考试机能联网。
+ *  - 发布构建的固定 @resource 已内嵌；题库/API 仍需要联网。
  */
 (function () {
     var w = window;
@@ -145,6 +145,8 @@
 
     var resText = {};
     var resURL = {};
+    var embeddedResources = w.__cefEmbeddedResources || {};
+    var resourceStatus = w.__cefResourceStatus = {};
     w.GM_getResourceText = function (name) {
         return (resText[name] !== undefined && resText[name] !== null) ? resText[name] : '';
     };
@@ -203,11 +205,22 @@
             w.__wnJQ = w.jQuery || w.$;
             restorePage();
             return Promise.all(Object.keys(RESOURCES).map(function (name) {
+                var embedded = embeddedResources[name];
+                if (embedded) {
+                    if (typeof embedded.text === 'string') {
+                        if (name === 'Table') JSON.parse(embedded.text);
+                        resText[name] = embedded.text;
+                    } else if (typeof embedded.dataUrl === 'string') resURL[name] = embedded.dataUrl;
+                    else throw new Error('Invalid embedded resource: ' + name);
+                    resourceStatus[name] = 'embedded';
+                    return;
+                }
                 var url = RESOURCES[name][0];
                 if (name === 'Img') { resURL[name] = url; return; }
                 return fetchText(url).then(function (text) {
                     if (name === 'Table') JSON.parse(text); // Invalid resource must not mark boot as ready.
                     resText[name] = text;
+                    resourceStatus[name] = 'network';
                 });
             }));
         }).catch(function (error) {

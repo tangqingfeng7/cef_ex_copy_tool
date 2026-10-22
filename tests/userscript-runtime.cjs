@@ -5,7 +5,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const root = path.resolve(__dirname, '..');
 const boot = fs.readFileSync(path.join(root, 'scripts/userscript_boot.js'), 'utf8');
-const shim = fs.readFileSync(path.join(root, 'out/js/gm_shim.js'), 'utf8');
+// Keep network-failure fixtures exercising the fallback, not vendored assets.
+const shim = fs.readFileSync(path.join(root, 'out/js/gm_shim.js'), 'utf8')
+    .replace(/^window\.__cefEmbeddedResources=.*;\r?\n/m, '');
 const flush = () => new Promise(setImmediate);
 function environment(fetch) {
     const timers = new Map(); let next = 0;

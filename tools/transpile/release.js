@@ -3,8 +3,10 @@ const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const { buildInfo, verifyDll } = require('../build-info.cjs');
+const { readResource } = require('../embedded-resources.cjs');
+const { decodeResource } = require('../resource-codec.cjs');
 const ROOT = path.resolve(__dirname, '../..');
-const FILES = ['winmm.dll', 'gm_shim.js', 'dat.js'];
+const FILES = ['winmm.dll'];
 const sha256 = data => crypto.createHash('sha256').update(data).digest('hex');
 function runPowerShell(script, args) {
     return JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive',
@@ -14,9 +16,23 @@ function runPowerShell(script, args) {
 function runtimeReadme(build) {
     return `cef_ex_copy_tool ${build.version} (Windows x86)\n\n` +
         `Git: ${build.commit || 'unknown'}${build.dirty ? ' (包含未提交修改)' : ''}\n源码指纹: ${build.sourceHash}\n\n` +
+        '本项目基于 https://github.com/SJYssr/CxExam_automatic_answering 修改。\n\n' +
+        'AI 主流程直接移植自上游 src/scripts/deepseek_ai_script.js，固定提交 3b534edae5208f1b3bdb256142491a6cd28de4a0；保留GPL-3.0及来源说明。\n' +
+        '支持的考试页面：开启AI后等待动态题目加载，自动取题（含题干/选项图片）并填入；中键用于手动重试。Ctrl+C取答案后点击空的编辑框/题目区域填入。不会自动提交。\n' +
         '安装：完全退出客户端，备份原有同名文件，再手动复制到 CXExam.exe 所在目录。\n' +
-        '只使用内置复制粘贴功能：复制 winmm.dll。\n' +
-        '使用外部脚本：同时复制本包内的 gm_shim.js 和 dat.js，不能混用不同构建。\n' +
+        '复制 winmm.dll 即可；gm_shim.js 和 dat.js 已作为资源内置，不读取外置 JS。\n' +
+        '更新脚本需要重新编译 DLL；固定字典和图片已离线内置；题库/API 仍需要网络。资源采用 LZMS 压缩和 SHA-256 损坏校验，要求 Windows 8 及以上。\n' +
+        'DeepSeek 图文：Ctrl+G 打开设置，填入 API Key 并启用；默认模型 deepseek-flash。默认关闭，不配置仍走原题库。\n' +
+        '简约面板：输入 Key 后点保存；设置会写入 DLL 同目录 config.json，重启后继续加载。测试连接独立执行，不保存或启用AI，仍可能少量收费。\n' +
+        '自动答题严格逐题请求并立即填入后再处理下一题；“对话”页保留上下文，输入框 Ctrl+V 可直接粘贴剪贴板图片。\n' +
+        '官方 api.deepseek.com 请求通过 DLL 内受限同源原生通道发送，可避开考试页 connect-src CSP；不会关闭全局浏览器安全策略，也不代理任意地址。\n' +
+        '连接正常只表示接口响应正常，不表示图片识别/答案正确；实际答题的选项范围与数量校验仍保留。\n' +
+        'Ctrl+G 再次关闭；默认50%不透明度，面板内 Ctrl+滚轮以10%调整，右键20%/50%切换，标题栏可拖动，Esc隐藏。\n' +
+        '这是页面内悬浮窗，不挡住其他页面区域；快捷键仅在客户端CEF获得焦点时生效，不是系统全局热键。\n' +
+        '也可将 config.example.json 复制为 DLL 同目录的 config.json，填入 Key 并把 enabled 改为 true；此文件是明文，请保护好。\n' +
+        '界面保存的 Key 不写网页 localStorage，会以明文写入本机 config.json，请勿上传或分享。图文会发送到配置的 API；请求可能收费。\n' +
+        'ai-only 不回退题库，ai-first 失败时回退原题库；网络/限流/格式错误不自动重发 AI，需在设置中清除缓存重试。\n' +
+        '题图由页面自动采集；跨域图片失败时不绕过 CORS/CSP，可刷新页面或在 AI 对话中粘贴截图咨询。\n' +
         '复制完成后重新启动客户端。本包不会自动安装或写入客户端。\n\n' +
         '诊断：Ctrl+Shift+P 打开开发者工具，在 Console 运行 __cefGetDiagnostics()。\n' +
         '崩溃转储：未处理异常会在 %LOCALAPPDATA%\\cef_ex_copy_tool\\crash-dumps 生成本地 .dmp；不会自动上传。\n' +
@@ -25,6 +41,10 @@ function runtimeReadme(build) {
         '源码与说明：https://github.com/tangqingfeng7/cef_ex_copy_tool\n许可证：见 LICENSE。\n';
 }
 function makeRelease() {
+    const example = fs.readFileSync(path.join(ROOT, 'config.example.json'));
+    const exampleConfig = JSON.parse(example);
+    if (exampleConfig.apiKey !== '' || exampleConfig.enabled !== false)
+        throw new Error('Refusing to publish credentials or an enabled config template');
     const dllPath = path.join(ROOT, 'out/build/x86-integrated/src/Release/winmm.dll');
     // Check before creating any release directory or rebuilding external scripts.
     const dll = fs.readFileSync(dllPath);
@@ -33,8 +53,16 @@ function makeRelease() {
     const pdb = fs.readFileSync(path.join(path.dirname(dllPath), 'winmm.pdb'));
     execFileSync(process.execPath, [path.join(__dirname, 'build.js')], { stdio: 'inherit' });
     const metadata = JSON.parse(fs.readFileSync(path.join(ROOT, 'out/js/metadata.json')));
-    const contents = [dll, fs.readFileSync(path.join(ROOT, 'out/js/gm_shim.js')),
-        fs.readFileSync(path.join(ROOT, 'out/js/dat.js'))];
+    const embeddedScripts = {};
+    for (const [name, id] of [['gm_shim.js', 201], ['dat.js', 202]]) {
+        const source = fs.readFileSync(path.join(ROOT, 'out/js', name));
+        const stored = readResource(dll, 10, id);
+        const resource = decodeResource(stored);
+        if (!resource.equals(source)) throw new Error('Stale embedded script: ' + name + '; rebuild DLL');
+        embeddedScripts[name] = { resourceId: id, bytes: source.length, storedBytes: stored.length,
+            storage: 'CXZ1/LZMS', sha256: sha256(source) };
+    }
+    const contents = [dll];
     const after = buildInfo(ROOT);
     verifyDll(dll, after);
     if (current.commit !== metadata.build.commit || current.dirty !== after.dirty)
@@ -51,7 +79,7 @@ function makeRelease() {
     fs.writeFileSync(path.join(symbolDir, 'winmm.pdb'), pdb);
     const signature = runPowerShell('check-symbols.ps1', ['-DllPath', path.join(stage, 'winmm.dll'),
         '-PdbPath', path.join(symbolDir, 'winmm.pdb')]);
-    const manifest = { schema: 3, scriptVersion: metadata.script.version,
+    const manifest = { schema: 4, scriptMode: 'embedded', embeddedScripts, scriptVersion: metadata.script.version,
         dllBuild, scriptBuild: metadata.build, git: { commit: after.commit, dirty: after.dirty },
         symbols: { archive: baseName + '-symbols.zip', ...signature, pdbSha256: sha256(pdb) },
         createdAt: new Date().toISOString(), files: {} };
@@ -61,7 +89,8 @@ function makeRelease() {
     });
     const readme = Buffer.from(runtimeReadme(dllBuild), 'utf8');
     const license = fs.readFileSync(path.join(ROOT, 'LICENSE'));
-    for (const [name, bytes] of [['README.txt', readme], ['LICENSE', license]]) {
+    for (const [name, bytes] of [['README.txt', readme], ['LICENSE', license], ['config.example.json', example],
+        ['UPSTREAM_AI_NOTICE.md', fs.readFileSync(path.join(ROOT, 'scripts/UPSTREAM_AI_NOTICE.md'))]]) {
         fs.writeFileSync(path.join(stage, name), bytes);
         manifest.files[name] = sha256(bytes);
     }
@@ -74,7 +103,7 @@ function makeRelease() {
         '分析崩溃时将调试器的符号路径指向本包解压目录。\n', 'utf8');
     const archives = {};
     for (const [source, name, files] of [
-        [stage, baseName + '.zip', [...FILES, 'README.txt', 'LICENSE', 'manifest.json']],
+        [stage, baseName + '.zip', [...FILES, 'README.txt', 'LICENSE', 'config.example.json', 'UPSTREAM_AI_NOTICE.md', 'manifest.json']],
         [symbolDir, baseName + '-symbols.zip', ['winmm.pdb', 'symbols.json', 'README.txt']]]) {
         const zip = path.join(stage, name);
         runPowerShell('zip-release.ps1', ['-SourceDir', source, '-ArchivePath', zip, '-FilesJson', JSON.stringify(files)]);

@@ -22,7 +22,13 @@
                 attempts: state.attempts || 0,
                 reason: state.reason || null,
                 failedFile: state.failedFile || null
-            }
+            },
+            injection: w.__cefInjectionMetrics || null,
+            ai: w.__cefDeepSeek ? w.__cefDeepSeek.status() : { enabled: false, status: 'not-loaded' },
+            assets: w.__cefResourceStatus || {},
+            resourceHashes: metadata.embeddedAssets || {},
+            timings: { bootMs: state.bootMs || 0, runMs: state.runMs || 0,
+                totalMs: state.totalMs || 0, evalMs: state.evalMs || 0 }
         }));
     };
     if (!w.__cefDiagnosticsAnnounced) {

@@ -2,9 +2,9 @@
 
 [![Windows x86 build](https://github.com/tangqingfeng7/cef_ex_copy_tool/actions/workflows/build.yml/badge.svg)](https://github.com/tangqingfeng7/cef_ex_copy_tool/actions/workflows/build.yml)
 
-基于 CEF Hook 的 Windows 客户端扩展，用于恢复页面文字选择、复制粘贴，并提供可选的外部用户脚本加载能力。项目修改自 [kazutoiris/cef-hook](https://github.com/kazutoiris/cef-hook)。
+基于 CEF Hook 的 Windows 客户端扩展，用于恢复页面文字选择、复制粘贴，并提供内置用户脚本加载能力。本项目基于 [SJYssr/CxExam_automatic_answering](https://github.com/SJYssr/CxExam_automatic_answering) 修改。
 
-当前构建目标为 **Windows x86（32 位）**，输出文件为 `winmm.dll`。仅支持与当前 Hook 接口兼容的 CEF 客户端，不保证适用于所有客户端版本。
+当前构建目标为 **Windows 8 及以上 / x86（32 位）**，输出文件为 `winmm.dll`。仅支持与当前 Hook 接口兼容的 CEF 客户端，不保证适用于所有客户端版本。
 
 ## 功能
 
@@ -14,7 +14,10 @@
 - 保留只读、禁用字段状态，以及按钮、复选框等控件的正常交互。
 - 提供截图、窗口置顶和窗口切换相关的 Hook。
 - 使用 `Ctrl+Shift+P` 打开开发者工具。
-- 可选加载 `gm_shim.js` 和 `dat.js`，更新外部脚本无需重新编译 DLL。
+- `gm_shim.js` 与转译后的 `dat.js` 以 LZMS 压缩的 RCDATA 资源内置于 DLL；不读取客户端目录中的外置 JS，更新脚本必须重新编译。
+- `Ctrl+G` 打开 DeepSeek 面板；自动答题严格按“请求一题、立即填一题、再处理下一题”的顺序运行。
+- 面板包含带上下文的 AI 对话；在对话输入框按 `Ctrl+V` 可直接粘贴剪贴板图片。题目附图由页面自动采集，不再提供单独的“附图”按钮。
+- 面板“保存”会把 AI 设置写入 `winmm.dll` 同目录的 `config.json`，客户端重启后继续加载，无需重复输入 Key。
 
 ## 客户端需要哪些文件
 
@@ -22,22 +25,29 @@
 
 | 使用方式 | 需要的文件 |
 | --- | --- |
-| 只使用 DLL 内置功能，包括复制粘贴修复 | `winmm.dll` |
-| 同时加载外部用户脚本 | `winmm.dll`、`gm_shim.js`、`dat.js` |
+| 使用内置功能及用户脚本 | `winmm.dll` |
+| 持久化 DeepSeek 设置 | 面板保存后自动生成的 `config.json`（可选） |
 
 完整部署后的目录示例：
 
 ```text
 客户端目录/
 ├── CXExam.exe
-├── winmm.dll
-├── gm_shim.js       # 可选，与 dat.js 配套
-└── dat.js           # 可选，与 gm_shim.js 配套
+├── winmm.dll        # 已包含 gm_shim.js 和 dat.js
+└── config.json      # 面板保存时生成；包含明文 API Key，请勿上传或分享
 ```
 
-外部脚本请使用构建生成的 `out/js/gm_shim.js` 和 `out/js/dat.js`，不要直接复制 `scripts/` 下的源码，也不要混用不同次构建的两个文件。
+CMake 会先检查内容缓存，必要时执行 Babel，生成配套的 `out/js/gm_shim.js` 和 `out/js/dat.js`，再编入 DLL。两者只是构建中间产物，无需部署；旧外置 JS 不会被此版本读取。
 
-`manifest.json` 是发布包的校验清单，记录 DLL 版本、源码指纹、Git 提交号、未提交修改标记、脚本构建标识和三个文件的 SHA-256。可用它核对发布文件的完整性，客户端运行不需要读取它。`winmm.pdb` 是调试符号，留在开发机并与对应 DLL 一起归档即可。
+`manifest.json` 是发布包的校验清单，记录 DLL 版本、源码指纹、Git 提交号、未提交修改标记、脚本构建标识、内嵌资源及 DLL 的 SHA-256。可用它核对发布文件的完整性，客户端运行不需要读取它。`winmm.pdb` 是调试符号，留在开发机并与对应 DLL 一起归档即可。
+
+## DeepSeek 设置与对话
+
+按 `Ctrl+G` 打开面板，填写 Key 后点击“保存”。DLL 通过受限的本地资源通道原子写入同目录 `config.json`；配置不会写入网页 `localStorage`。Key 在文件中为明文，部署和备份时自行保护，不要提交到 Git。
+
+自动答题不会一次性并发整页请求：上一题取得答案并写入页面后，才会请求下一题。若题库用“简答题”容器包装正文中的 `[填空题]`，正文标记优先按填空题解析。
+
+切换到“对话”页可连续追问，最近上下文会随下一次请求发送。把截图复制到剪贴板后，直接在对话输入框按 `Ctrl+V` 即可加入图片；图片可在发送前移除。“清空对话”只清理当前页面的对话上下文，不删除已保存的 Key。
 
 ## 构建环境
 
@@ -45,7 +55,7 @@
 | --- | --- |
 | Visual Studio 2022 Build Tools | 安装 C++ 编译工具、Windows SDK 和 CMake；构建脚本默认路径为 `D:\Admin\VSBuildTools` |
 | Detours | 使用 `x86-windows` 版本，必须包含头文件及 `lib/detours.lib` |
-| Node.js / npm | DLL 构建时生成版本与源码指纹，以及构建外部脚本、执行测试和打包；需可从终端调用 |
+| Node.js / npm | DLL 构建时生成版本与源码指纹，以及转译内嵌脚本、执行测试和打包；需可从终端调用 |
 | Microsoft Edge | 浏览器回归测试使用本机 Edge，无需另行下载 Playwright 浏览器 |
 
 DLL 构建脚本依次在以下位置查找 Detours，不会自动安装依赖：
@@ -86,7 +96,7 @@ powershell -ExecutionPolicy Bypass -File tools/build-dll.ps1 -BuildToolsPath 'D:
 
 构建脚本只生成项目内的产物。项目不提供一键部署或自动复制到客户端的功能。
 
-### 构建外部脚本
+### 单独检查脚本转译（不会更新 DLL）
 
 ```powershell
 npm run build --prefix tools/transpile
@@ -100,7 +110,7 @@ out/js/gm_shim.js
 out/js/metadata.json
 ```
 
-`metadata.json` 供打包工具读取，不需要放进客户端。
+这些文件供资源编译器和打包校验读取，不需要放进客户端。正式构建 DLL 时会自动执行此转译步骤。
 
 ## 测试与打包
 
@@ -120,8 +130,7 @@ npm run package --prefix tools/transpile
 ```text
 发布目录/
 ├── winmm.dll
-├── gm_shim.js
-├── dat.js
+├── config.example.json
 ├── README.txt
 ├── LICENSE
 ├── manifest.json
@@ -136,7 +145,7 @@ npm run package --prefix tools/transpile
 
 **打包会重新构建 JavaScript，并生成运行 ZIP 与独立的调试符号 ZIP；使用现有 DLL，不会编译 DLL 或部署到客户端。** 修改 DLL 源码或内置脚本后，必须先重新编译或运行统一验证。
 
-运行 ZIP 包含三个运行文件、使用说明、许可证与校验清单；符号 ZIP 包含 `winmm.pdb`、符号清单和调试说明。打包会校验 PDB 的 GUID、age 与 DLL 是否匹配，缺少或不匹配时停止。`archives.json` 记录两个 ZIP 的 SHA-256；生成后还会解压读取各条目，核对文件哈希。全部检查成功才生成正式发布目录，失败中间产物保留在 `.partial-*` 目录。
+运行 ZIP 包含运行文件 `winmm.dll`、可选配置模板 `config.example.json`、使用说明、许可证与校验清单；符号 ZIP 包含 `winmm.pdb`、符号清单和调试说明。打包会校验 PDB 的 GUID、age 与 DLL 是否匹配，缺少或不匹配时停止。`archives.json` 记录两个 ZIP 的 SHA-256；生成后还会解压读取各条目，核对文件哈希。全部检查成功才生成正式发布目录，失败中间产物保留在 `.partial-*` 目录。
 
 统一测试也包含实际打包与 ZIP 内容校验，因此测试通过后会留下一个可用发布目录。
 
@@ -150,14 +159,14 @@ vcpkg 二进制缓存与 npm 缓存会在后续运行复用。Dependabot 每周�
 
 打包前会读取 DLL 内嵌的构建记录，与当前源码指纹、`VERSION`、Git 提交号及 `x86/Release` 配置比较。不匹配、缺少构建记录时会报错并停止，不会生成发布目录。源码指纹覆盖 `src/`、`cef/`、`chromium/`、内置脚本和相关构建文件，包含尚未提交的源码内容，不依赖文件修改时间。
 
-只更新外部脚本不需要重新编译 DLL；提交产生新的 Git 提交号后，需要重新编译再打包。未提交修改允许打包，但会明确记录 `dirty: true`。源码压缩包没有 Git 信息时，提交号显示为 `null`，仍检查源码指纹。该检查用于识别版本混用，不是数字签名。
+更新 `dat.js` 或 `gm_shim.js` 也需要重新编译 DLL；提交产生新的 Git 提交号后，需要重新编译再打包。未提交修改允许打包，但会明确记录 `dirty: true`。源码压缩包没有 Git 信息时，提交号显示为 `null`，仍检查源码指纹。该检查用于识别版本混用，不是数字签名。
 
-## 手动安装与回退
+## 手动安装与回滚
 
 1. 完全退出客户端。
 2. 手动备份客户端目录中原有的同名文件，并记录哪些文件原来不存在。
-3. 仅使用内置功能时，复制编译生成的 `winmm.dll` 到 `CXExam.exe` 所在目录。
-4. 需要外部用户脚本时，再复制同次构建的 `out/js/gm_shim.js` 和 `out/js/dat.js`，也可以直接从发布目录取这三个文件。
+3. 复制编译生成的 `winmm.dll` 到 `CXExam.exe` 所在目录。
+4. 无需复制 `gm_shim.js`、`dat.js`；本 DLL 不读取这些外置文件。
 5. 重新启动客户端。
 
 回退时先退出客户端，再手动恢复备份；本次新增、原来不存在的文件应移出客户端目录。构建、测试和打包均不会替你修改客户端文件。
@@ -170,18 +179,18 @@ vcpkg 二进制缓存与 npm 缓存会在后续运行复用。Dependabot 每周�
 | `scripts/clipboard_fix.js` | 重新编译 DLL，脚本内置于二进制 | `winmm.dll` |
 | `scripts/userscript_boot.js` | 重新编译 DLL，脚本内置于二进制 | `winmm.dll` |
 | `scripts/diagnostics.js` 或 `VERSION` | 重新编译 DLL | `winmm.dll` |
-| `scripts/dat.js` 或 `scripts/gm_shim.js` | 重新构建 JavaScript | 配套的 `dat.js`、`gm_shim.js` |
+| `scripts/dat.js` 或 `scripts/gm_shim.js` | 重新编译 DLL（自动转译并内嵌） | `winmm.dll` |
 
-外部主脚本的构建入口是 `scripts/dat.js`。当前脚本中的 jQuery 使用局部 `$` / `jQuery`，通过 `noConflict(true)` 保留宿主页面的库和插件。更新上游脚本时应保留这项适配并运行回归测试，否则可能出现“进入考试”按钮无响应等问题。
+内置主脚本的构建入口是 `scripts/dat.js`。当前脚本中的 jQuery 使用局部 `$` / `jQuery`，通过 `noConflict(true)` 保留宿主页面的库和插件。更新上游脚本时应保留这项适配并运行回归测试，否则可能出现“进入考试”按钮无响应等问题。
 
-旧本地热更新服务和加载器已移除。更新外部脚本统一使用构建命令，再手动复制配套文件；新生成的两个文件具有相同构建标识，主脚本发现标识不匹配时会停止执行并报告 `script-pair-mismatch`。
+更新脚本后执行 DLL 构建命令，再手动替换 DLL。构建将一对具有相同标识的脚本一起内嵌；打包会逐字节核对 DLL 资源与转译产物，不匹配时拒绝打包。
 
 编译期开关位于 `src/thread.cpp`，修改后需要重新编译：
 
 | 开关 | 默认值 | 作用 |
 | --- | --- | --- |
 | `ENABLE_UNBLOCK_SWITCH` | `1` | 窗口切换与置顶相关处理 |
-| `ENABLE_USERSCRIPT` | `1` | 加载客户端目录中的外部脚本 |
+| `ENABLE_USERSCRIPT` | `1` | 从本 DLL 资源加载内置用户脚本 |
 | `ENABLE_MEMORY_PATCH` | `0` | 针对特定版本的固定地址补丁，默认关闭 |
 
 ## 查看版本与诊断信息
@@ -209,7 +218,7 @@ __cefGetDiagnostics()
 
 同一次注入保留第一个读取/解析失败，不会被后续初始化或旧的异步任务覆盖；运行时脚本解析失败时不执行主脚本。页面后续发起新的加载尝试后才清除该次错误。已经处于 `loading` 或 `ready` 的脚本不会重复执行。
 
-外部脚本采用进程内缓存，每个文件保留一份处理后的数据，复用 UTF-8 转码、主脚本包装和 Base64 编码结果。每次加载仍检查文件身份、大小、最后写入时间和变更时间；变化时重新读取，文件缺失、锁定、空文件或非法 UTF-8 不会沿用旧缓存。缓存不跨进程持久化，也不会把磁盘更新自动应用到已经执行成功的页面；更新文件后仍应重启客户端。
+内置脚本从当前模块的 RCDATA 资源读取，校验 16 MiB 解压上限、实际长度及 SHA-256，解压后严格按 UTF-8 解码，缓存编码和包装结果，仍使用原有分片注入。资源缺失或编码非法时报告 `embedded-resource-missing-or-invalid`。不写出临时 JS 文件、不检查外置脚本，也不支持磁盘热更新。
 
 DLL 版本由根目录 `VERSION` 管理，文件属性的“详细信息”中也可查看。原生调试输出使用 `[CefHook]` 前缀，包含构建记录和运行时版本；诊断快照不包含页面 URL、答题内容或剪贴板正文。未提交源码通过指纹区分，不能只凭 Git 提交号判断两个 DLL 完全相同。
 
@@ -229,13 +238,13 @@ DLL 版本由根目录 `VERSION` 管理，文件属性的“详细信息”中�
 
 这两部分由 DLL 内置的 `scripts/clipboard_fix.js` 控制。需要重新编译并替换 `winmm.dll`，仅更新 `dat.js` 不会生效。鼠标焦点 outline、输入框本身的边框和文字选中高亮是不同的样式，当前修复只隐藏鼠标操作产生的焦点 outline。
 
-**外部脚本无法初始化或请求失败？**
+**内置用户脚本无法初始化或请求失败？**
 
-先确认使用同次构建的 `gm_shim.js` 和 `dat.js`。外部资源与接口仍可能需要网络；当前 `GM_xmlhttpRequest` 使用 fetch 直连，受目标服务的 CORS 限制。它不是完整的浏览器扩展环境。
+先确认已替换为本次构建的 DLL，并查看内置脚本的诊断状态。固定 Table 字典和图片已内置，无需 CDN；题库/API 仍需要网络；当前 `GM_xmlhttpRequest` 使用 fetch 直连，受目标服务的 CORS 限制。它不是完整的浏览器扩展环境。
 
 **进入页面后出现异常或客户端崩溃？**
 
-退出客户端后恢复备份。排查外部脚本时，可以暂时移出客户端目录中的两个 JS 文件，再启动验证。到 `%LOCALAPPDATA%\cef_ex_copy_tool\crash-dumps` 查找对应 `.dmp`，并保留发生问题的 DLL、同次构建的符号 ZIP，避免混用不同构建的符号文件。当前不支持运行期间强制卸载 DLL。
+退出客户端后恢复备份。排查用户脚本时，将 `ENABLE_USERSCRIPT` 改为 `0` 后重新编译验证；移走外置 JS 不会影响此版本。到 `%LOCALAPPDATA%\cef_ex_copy_tool\crash-dumps` 查找对应 `.dmp`，并保留发生问题的 DLL、同次构建的符号 ZIP，避免混用不同构建的符号文件。当前不支持运行期间强制卸载 DLL。
 
 **为什么某些输入框仍不能粘贴？**
 
@@ -246,7 +255,7 @@ DLL 版本由根目录 `VERSION` 管理，文件属性的“详细信息”中�
 | 路径 | 内容 |
 | --- | --- |
 | `src/` | DLL 源码、CEF 回调与 Hook |
-| `scripts/` | 内置补丁和外部脚本源码 |
+| `scripts/` | 内置补丁和用户脚本源码 |
 | `tools/` | 构建、测试与打包工具 |
 | `tests/` | 原生与 JavaScript 回归测试 |
 | `cef/`、`chromium/` | 编译使用的第三方源码与头文件 |

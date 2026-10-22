@@ -1,0 +1,3 @@
+#include "@CMAKE_CURRENT_SOURCE_DIR@/userscript_resources.h"
+IDR_GM_SHIM_SCRIPT RCDATA "@CMAKE_SOURCE_DIR@/out/js/gm_shim.bin"
+IDR_DAT_SCRIPT RCDATA "@CMAKE_SOURCE_DIR@/out/js/dat.bin"

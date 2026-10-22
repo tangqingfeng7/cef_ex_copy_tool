@@ -10,3 +10,6 @@
 
 # Local documentation (not published to GitHub)
 /docs/
+
+# Runtime AI credentials (never commit)
+/config.json

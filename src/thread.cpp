@@ -3,15 +3,20 @@
 #include "clipboard_repair.h"
 #include "build_info.h"
 #include "crash_dump.h"
-#include "script_cache.h"
+#include "userscript_resources.h"
 #include "instance_hooks.h"
 #include "cef_frame_scope.h"
 #include <vector>
 #include <algorithm>
+#include <climits>
 #include "include/capi/cef_browser_capi.h"
 #include "include/internal/cef_types_win.h"
 #include "include/capi/cef_client_capi.h"
 #include "include/internal/cef_win.h"
+#include "embedded_script.h"
+#include "frame_documents.h"
+#include "ai_config.h"
+#include "ai_native_proxy.h"
 
 PVOID g_cef_browser_host_create_browser = nullptr;
 // 诊断开关：解除切屏限制（Win+Tab/Alt+Tab）的 SetWindowsHookEx 挂钩。
@@ -23,8 +28,8 @@ PVOID g_cef_browser_host_create_browser = nullptr;
 // 置 0 可关闭，用于隔离排查。
 #define ENABLE_MEMORY_PATCH 0
 
-// 功能开关：从宿主 exe 同目录读取 gm_shim.js + dat.js 注入外部油猴脚本。
-// 置 0 可关闭外部脚本注入。
+// 功能开关：从当前模块的 RCDATA 读取配套 gm_shim.js + dat.js。
+// 置 0 可关闭内置用户脚本注入；不读取外置 JS。
 #define ENABLE_USERSCRIPT 1
 
 // The record is embedded in the DLL and read by the release verifier.
@@ -250,6 +255,27 @@ void SetAsPopup(cef_window_info_t* window_info) {
     window_info->height = CW_USEDEFAULT;
 }
 
+static bool ToggleDeepSeekPanel(struct _cef_browser_t* browser);
+
+// Intercept before renderer dispatch: works while a child editor iframe owns
+// focus and prevents native + DOM handlers from toggling the panel twice.
+int CEF_CALLBACK hook_cef_on_pre_key_event(
+    struct _cef_keyboard_handler_t* self, struct _cef_browser_t* browser,
+    const struct _cef_key_event_t* event, cef_event_handle_t os_event,
+    int* is_keyboard_shortcut) {
+    if (event && event->type == KEYEVENT_RAWKEYDOWN && event->windows_key_code == 'G'
+        && (event->modifiers & EVENTFLAG_CONTROL_DOWN)
+        && !(event->modifiers & (EVENTFLAG_ALT_DOWN | EVENTFLAG_SHIFT_DOWN | EVENTFLAG_COMMAND_DOWN))) {
+        // Windows lParam bit 30 marks an auto-repeat, not another press.
+        if ((static_cast<unsigned int>(event->native_key_code) & (1u << 30)) || ToggleDeepSeekPanel(browser)) {
+            if (is_keyboard_shortcut) *is_keyboard_shortcut = 1;
+            return 1;
+        }
+    }
+    auto original = InstanceHooks<cef_keyboard_handler_t>::original(self).on_pre_key_event;
+    return original ? original(self, browser, event, os_event, is_keyboard_shortcut) : 0;
+}
+
 int CEF_CALLBACK hook_cef_on_key_event(
     struct _cef_keyboard_handler_t* self,
     struct _cef_browser_t* browser,
@@ -280,30 +306,66 @@ struct _cef_keyboard_handler_t* CEF_CALLBACK hook_cef_get_keyboard_handler(
     auto original = InstanceHooks<cef_client_t>::original(self).get_keyboard_handler;
     auto keyboard_handler = original ? original(self) : nullptr;
     InstanceHooks<cef_keyboard_handler_t>::install(keyboard_handler, [](cef_keyboard_handler_t* h) {
+        h->on_pre_key_event = hook_cef_on_pre_key_event;
         h->on_key_event = hook_cef_on_key_event;
     });
     return keyboard_handler;
 }
 
+struct _cef_request_handler_t* CEF_CALLBACK hook_cef_get_request_handler(
+    struct _cef_client_t* self) {
+    auto original = InstanceHooks<cef_client_t>::original(self).get_request_handler;
+    auto request_handler = original ? original(self) : nullptr;
+    if (request_handler) InstallNativeAiRequestHandlerHooks(request_handler);
+    else request_handler = CreateNativeAiRequestHandler();
+    return request_handler;
+}
+
 #if ENABLE_USERSCRIPT
-// 获取宿主 exe 所在目录。
-static std::wstring GetExeDir() {
-    wchar_t path[MAX_PATH] = {};
-    GetModuleFileNameW(NULL, path, MAX_PATH);
-    PathRemoveFileSpecW(path);
-    return std::wstring(path);
+static FrameDocuments g_frameDocuments;
+// Resolve the actual containing module, not a possibly ambiguous winmm.dll name.
+// Load resources in memory; no extraction and no dependency on the EXE directory.
+static std::wstring LoadEmbeddedUserScript(WORD id) {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&LoadEmbeddedUserScript), &module)) return {};
+    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(id), RT_RCDATA);
+    if (!resource) return {};
+    DWORD size = SizeofResource(module, resource);
+    HGLOBAL loaded = LoadResource(module, resource);
+    const char* bytes = loaded ? static_cast<const char*>(LockResource(loaded)) : nullptr;
+    if (!bytes || !size || size > INT_MAX) return {};
+    std::string decoded;
+    if (!DecodeScriptPacket(reinterpret_cast<const unsigned char*>(bytes), size, decoded)) return {};
+    std::wstring source;
+    if (!ScriptUtf8ToWide(decoded, source)) return {};
+    return source;
 }
 
 // 执行一段 JS（单次 execute_java_script），并释放临时 cef_string，避免内存泄漏。
-static void ExecJs(struct _cef_frame_t* frame, const std::wstring& js) {
+static void ExecJs(struct _cef_frame_t* frame, const std::wstring& js,
+                   const std::wstring& sourceName = L"cef-cx/bootstrap.js") {
     if (!FrameCanExecute(frame) || !func_cef_string_from_ptr) return;
     cef_string_t code{};
     cef_string_t url{};
-    if (func_cef_string_from_ptr(js.c_str(), js.length(), &code))
+    if (func_cef_string_from_ptr(js.c_str(), js.length(), &code) &&
+        func_cef_string_from_ptr(sourceName.c_str(), sourceName.length(), &url))
         frame->execute_java_script(frame, &code, &url, 0);
+    if (url.dtor) url.dtor(url.str);
     if (code.dtor) {
         code.dtor(code.str);
     }
+}
+
+static bool ToggleDeepSeekPanel(struct _cef_browser_t* browser) {
+    if (!browser || !browser->get_main_frame || !func_cef_string_from_ptr) return false;
+    auto* frame = browser->get_main_frame(browser); // Returned with one reference.
+    if (!frame) return false;
+    const bool ready = FrameCanExecute(frame);
+    if (ready) ExecJs(frame, L"if(window.__cefDeepSeek&&window.__cefDeepSeek.toggleSettings)window.__cefDeepSeek.toggleSettings();", L"cef-cx/ai-hotkey.js");
+    if (frame->base.release) frame->base.release(&frame->base);
+    return ready;
 }
 
 // 将宽字符串先转 UTF-8，再做 base64 编码（输出仅含 ASCII，拼接时无需转义）。
@@ -344,7 +406,7 @@ static std::wstring Base64EncodeUtf8(const std::wstring& wide) {
     return out;
 }
 
-// The cache stores the encoded wrapper too; repeat loads only inspect metadata.
+// Preserve the existing entry wrapper and private jQuery binding.
 static std::wstring WrapUserScript(const std::wstring& mainScript) {
     return L"window.__cefRunUserScript(function(){\nreturn (function($, jQuery){\n" + mainScript +
         L"\n}).call(window, window.__wnJQ||window.$, window.__wnJQ||window.jQuery);\n});\n";
@@ -356,36 +418,44 @@ static void InjectScriptChunked(struct _cef_frame_t* frame,
     ExecJs(frame, L"window.__wnB='';");
     const size_t CHUNK = 8000;
     for (size_t i = 0; i < encoded.size(); i += CHUNK)
-        ExecJs(frame, L"if(window.__cefInjectionAllowed)window.__wnB+=\"" + encoded.substr(i, CHUNK) + L"\";");
+        ExecJs(frame, L"if(window.__cefInjectionAllowed)window.__wnB+=\"" + encoded.substr(i, CHUNK) + L"\";", L"cef-cx/transport/" + file);
     ExecJs(frame, L"try{if(window.__cefInjectionAllowed){"
         L"window.__cefEvaluateScript('" + file + L"',decodeURIComponent(escape(atob(window.__wnB))));"
         L"}}catch(e){window.__cefReportUserScriptFailure('" + file + L"','decode','decode-error');}"
         L"finally{window.__wnB='';}");
 }
 
-static void InjectUserScript(struct _cef_frame_t* frame) {
+static void InjectUserScript(struct _cef_frame_t* frame, unsigned long long generation = 0) {
     if (!FrameCanExecute(frame)) return;
+    const ULONGLONG begin = GetTickCount64();
     ExecJs(frame, kUserScriptBootScript);
     ExecJs(frame, L"window.__cefInjectionAllowed=window.__cefBeginUserScriptInjection();");
-    static ScriptFileCache shimCache(Base64EncodeUtf8);
-    static ScriptFileCache datCache([](const std::wstring& source) {
-        return Base64EncodeUtf8(WrapUserScript(source));
-    });
-    const std::wstring dir = GetExeDir();
-    auto shim = shimCache.load(dir + L"\\gm_shim.js");
-    if (!shim) {
+    static const std::wstring shim = Base64EncodeUtf8(LoadEmbeddedUserScript(IDR_GM_SHIM_SCRIPT));
+    static const std::wstring dat = [] {
+        const auto source = LoadEmbeddedUserScript(IDR_DAT_SCRIPT);
+        return source.empty() ? std::wstring() : Base64EncodeUtf8(WrapUserScript(source));
+    }();
+    if (shim.empty()) {
         ExecJs(frame, L"if(window.__cefInjectionAllowed)window.__cefReportUserScriptFailure("
-            L"'gm_shim.js','read','missing-or-unreadable');");
+            L"'gm_shim.js','read','embedded-resource-missing-or-invalid');");
         return;
     }
-    auto dat = datCache.load(dir + L"\\dat.js");
-    if (!dat) {
+    if (dat.empty()) {
         ExecJs(frame, L"if(window.__cefInjectionAllowed)window.__cefReportUserScriptFailure("
-            L"'dat.js','read','missing-or-unreadable');");
+            L"'dat.js','read','embedded-resource-missing-or-invalid');");
         return;
     }
-    InjectScriptChunked(frame, L"gm_shim.js", *shim);
-    InjectScriptChunked(frame, L"dat.js", *dat);
+    const ULONGLONG prepared = GetTickCount64();
+    const size_t chunks = (shim.size() + 7999) / 8000 + (dat.size() + 7999) / 8000;
+    ExecJs(frame, L"window.__cefInjectionMetrics={storage:'CXZ1/LZMS',generation:" +
+        std::to_wstring(generation) + L",chunks:" + std::to_wstring(chunks) +
+        L",encodedCharacters:" + std::to_wstring(shim.size() + dat.size()) +
+        L",prepareMs:" + std::to_wstring(prepared - begin) + L"};");
+    ExecJs(frame, LoadAiConfigPrelude(), L"cef-cx/ai-config.js");
+    InjectScriptChunked(frame, L"gm_shim.js", shim);
+    InjectScriptChunked(frame, L"dat.js", dat);
+    ExecJs(frame, L"if(window.__cefInjectionMetrics)window.__cefInjectionMetrics.dispatchMs=" +
+        std::to_wstring(GetTickCount64() - prepared) + L";");
 }
 
 #endif
@@ -397,7 +467,8 @@ static void InjectCrackShim(struct _cef_frame_t* frame) {
     cef_string_t url{};
     std::wstring script = L"window.__cefBuildInfo=" + std::wstring(kBuildRecord + kBuildRecordPrefix) +
         L";window.__cefRuntimeInfo=" + RuntimeVersionJson() +
-        L";window.__cefNativeInfo=" + NativeDiagnosticsJson() + L";\n";
+        L";window.__cefNativeInfo=" + NativeDiagnosticsJson() +
+        L";window.__cefNativeAiProxy=Object.freeze({version:1,deepseekOnly:true,configWrite:true});\n";
 #if !ENABLE_USERSCRIPT
     script += L"window.__cefUserScriptState={status:'disabled',reason:'build-option'};\n";
 #else
@@ -406,9 +477,12 @@ static void InjectCrackShim(struct _cef_frame_t* frame) {
 #endif
     script += kClipboardRepairScript;
     script += kDiagnosticsScript;
-    if (func_cef_string_from_ptr(script.c_str(), script.size(), &code)) {
+    const std::wstring sourceName = L"cef-cx/repair.js";
+    if (func_cef_string_from_ptr(script.c_str(), script.size(), &code) &&
+        func_cef_string_from_ptr(sourceName.c_str(), sourceName.size(), &url)) {
         frame->execute_java_script(frame, &code, &url, 0);
     }
+    if (url.dtor) url.dtor(url.str);
     if (code.dtor) code.dtor(code.str);
 }
 
@@ -420,6 +494,10 @@ void CEF_CALLBACK hook_cef_on_load_start(
     cef_transition_type_t transition_type)
 {
     ScopedCefFrame retained(frame);
+#if ENABLE_USERSCRIPT
+    if (FrameCanExecute(retained.get()) && frame->is_main && frame->is_main(frame))
+        g_frameDocuments.start(frame, browser);
+#endif
     InjectCrackShim(retained.get());
 
     auto original = InstanceHooks<cef_load_handler_t>::original(self).on_load_start;
@@ -442,7 +520,11 @@ void CEF_CALLBACK hook_cef_on_load_end(
 #if ENABLE_USERSCRIPT
     // 仅在主框架注入，避免子框架/多次加载重复注入大脚本
     if (frame->is_main && frame->is_main(frame)) {
-        InjectUserScript(retained.get());
+        unsigned long long generation = 0;
+        if (g_frameDocuments.begin(retained.get(), browser, generation))
+            InjectUserScript(retained.get(), generation);
+        else ExecJs(retained.get(), L"if(window.__cefInjectionMetrics)window.__cefInjectionMetrics.duplicateSkips=" +
+            std::to_wstring(g_frameDocuments.skipped()) + L";");
     }
 #endif
 }
@@ -470,6 +552,7 @@ int hook_cef_browser_host_create_browser(
     InstanceHooks<cef_client_t>::install(client, [](cef_client_t* c) {
         if (c->get_keyboard_handler) c->get_keyboard_handler = hook_cef_get_keyboard_handler;
         if (c->get_load_handler) c->get_load_handler = hook_cef_get_load_handler;
+        if (CEF_MEMBER_EXISTS(c, get_request_handler)) c->get_request_handler = hook_cef_get_request_handler;
     });
 
     return reinterpret_cast<decltype(&hook_cef_browser_host_create_browser)>

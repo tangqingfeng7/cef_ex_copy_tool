@@ -9,10 +9,5 @@ $taskCTest = $taskEnvironment.CTestPath
 if ($LASTEXITCODE -ne 0) { throw 'Native tests failed' }
 & node (Join-Path $PSScriptRoot 'transpile\build.js')
 if ($LASTEXITCODE -ne 0) { throw 'Script build failed' }
-$taskTests = @(Get-ChildItem (Join-Path $taskRoot 'tests') -Filter '*.cjs' | ForEach-Object { $_.FullName })
-& node --test @taskTests
-if ($LASTEXITCODE -ne 0) { throw 'Runtime tests failed' }
-& node (Join-Path $PSScriptRoot 'test-clipboard.cjs') (Join-Path $taskRoot 'out\build\x86-integrated\src\Release\winmm.dll')
-if ($LASTEXITCODE -ne 0) { throw 'Browser clipboard tests failed' }
-& node --test (Join-Path $taskRoot 'tests/release.test.js')
-if ($LASTEXITCODE -ne 0) { throw 'Release archive or symbol tests failed' }
+& node (Join-Path $PSScriptRoot 'test-js.cjs')
+if ($LASTEXITCODE -ne 0) { throw 'JS/browser/incremental/archive tests failed' }

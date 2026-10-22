@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "mode": "ai-only",
+  "apiKey": "",
+  "baseUrl": "https://api.deepseek.com",
+  "model": "deepseek-flash",
+  "timeoutMs": 90000,
+  "concurrency": 1,
+  "maxImages": 6,
+  "imageMaxEdge": 2048
+}

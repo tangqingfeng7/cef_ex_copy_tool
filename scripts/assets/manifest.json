@@ -1,0 +1,20 @@
+{
+  "package": "tiku-static-assets",
+  "version": "1.0.0",
+  "assets": {
+    "Table": {
+      "file": "cx_table.json",
+      "url": "https://cdn.jsdelivr.net/npm/tiku-static-assets@1.0.0/cx_table.json",
+      "mime": "application/json",
+      "sha256": "3ce036e6194f686ea54b0e8206568724140b5055950cd6ac62365f5ae5d24e6c",
+      "bytes": 355335
+    },
+    "Img": {
+      "file": "6.png",
+      "url": "https://cdn.jsdelivr.net/npm/tiku-static-assets@1.0.0/6.png",
+      "mime": "image/png",
+      "sha256": "f9bd2174ece4b95371fc9c3ef71a449797ce1dfe2aa09a7e4d60726ad5896954",
+      "bytes": 207378
+    }
+  }
+}

@@ -6131,6 +6131,7 @@ var GLOBAL = {
         }
     }
     function reportOnline() {
+        if (window.__cefDeepSeek && window.__cefDeepSeek.enabled() && window.__cefDeepSeek.mode() === "ai-only") return;
         probeHosts();
         GM_xmlhttpRequest({
             method: "POST",
@@ -6538,6 +6539,16 @@ var GLOBAL = {
 	 * @param initData
 	 * @returns {Promise<{msg: string, success: boolean}|{msg: (*|string|string), success: boolean, num: (*|string), list: *[]}|{msg: string, success: boolean, num: string, list: *[]}>}
 	 */    async function formatSearchAnswer(initData) {
+        if (window.__cxUpstreamAI && window.__cxUpstreamAI.active()) return { success: false, msg: "上游 AI 已接管：鼠标中键填充，Ctrl+C 获取答案" };
+        delete initData.__cefAI;
+        delete initData.__cefAIValidate;
+        if (window.__cefDeepSeek && window.__cefDeepSeek.enabled()) {
+            try { return await window.__cefDeepSeek.answer(initData); }
+            catch (error) {
+                if (window.__cefDeepSeek.mode() === "ai-only" || error.code === "STALE" || error.code === "CANCELED")
+                    return { success: false, msg: error.message };
+            }
+        }
         const data = {
             plat: initData.plat ? parseInt(initData.plat) : null,
             qid: initData.qid ? String(initData.qid) : null,
@@ -6677,8 +6688,15 @@ var GLOBAL = {
 	 * @param handler 执行的函数
 	 * @param ignore_click
 	 */    async function defaultQuestionResolve(list, data, handler, ignore_click) {
+        if (data.__cefAI && (!data.__cefAIValidate || !data.__cefAIValidate()))
+            return { style: "error-row", ans: "题目已变化，未填充旧答案", question: data.question };
         let targetOptionsList = [];
-        for (const answers of list) {
+        if (data.__cefAI) {
+            if ([2, 4, 5, 6, 7, 8].includes(data.type)) return fillBlank(list[0], data, handler);
+            const indices = data.type === 3 ? [Number(isTrue(list[0][0]) ? isFalse(data.options[0]) : isTrue(data.options[0]))] : list[0].map(x => x.charCodeAt(0) - 65);
+            targetOptionsList.push(new Set(indices));
+        }
+        for (const answers of data.__cefAI ? [] : list) {
             if (data.type === 2 || data.type === 4 || data.type === 5 || data.type === 6 || data.type === 7 || data.type === 8) {
                 return fillBlank(answers, data, handler);
             } else if (data.type === 3) {
@@ -6761,7 +6779,10 @@ var GLOBAL = {
     async function fillBlank(answers, data, handler) {
         let ans = answers.length > data.$options.length ? answers.slice(0, data.$options.length) : answers;
         for (let index in ans) {
-            if (typeof handler === "function") await handler(data.type, ans[index], data.$options.eq(index));
+            if (data.__cefAI) {
+                if (!window.__cefDeepSeek.fillText(data.$options.eq(index).get(0), ans[index]))
+                    return { style: "error-row", ans: "输入框不可安全写入，请人工填入：" + answers.join("===="), question: data.question };
+            } else if (typeof handler === "function") await handler(data.type, ans[index], data.$options.eq(index));
         }
         return {
             style: "success-row",
@@ -6991,6 +7012,9 @@ var GLOBAL = {
 	 *   fillFinish   单题答完后的回调
 	 * @param options
 	 */    async function WorkerJSPlus(options) {
+        // The copied upstream AI owns exam-page collection/fill. Do not race
+        // its middle-click/copy workflow with the legacy automatic AI worker.
+        if (window.__cxUpstreamAI && window.__cxUpstreamAI.active()) return;
         if (GLOBAL.isMatch) return;
         const match = options.match ? typeof options.match === "boolean" ? options.match : options.match() : false;
         if (!match) return;
@@ -7018,6 +7042,7 @@ var GLOBAL = {
             while (true) {
                 if (arr.length === 0) return;
                 await sleep((isNaN(parseInt(GM_getValue("search_delay"))) ? 2 : GM_getValue("search_delay")) * 1e3);
+                if (window.__cxUpstreamAI && window.__cxUpstreamAI.active()) return;
                 if (GM_getValue("__stop")) {
                     continue;
                 }
@@ -7055,7 +7080,8 @@ var GLOBAL = {
                         tip: "准备答第" + GLOBAL.index + "题"
                     });
                     const formatResult = await formatSearchAnswer(data);
-                    const hookAnswer = data.answer && data.answer.length > 0 && GM_getValue("start_pay");
+                    if (window.__cxUpstreamAI && window.__cxUpstreamAI.active()) return;
+                    const hookAnswer = !(window.__cefDeepSeek && window.__cefDeepSeek.enabled()) && data.answer && data.answer.length > 0 && GM_getValue("start_pay");
                     const formatAns = hookAnswer ? {
                         success: true,
                         num: formatResult.num,
@@ -7067,10 +7093,11 @@ var GLOBAL = {
                         });
                         const func = !hookAnswer && formatResult.answers ? defaultFillAnswer : defaultQuestionResolve;
                         let r = await func(hookAnswer ? formatAns.list : formatAns.answers ? formatResult.answers : formatAns.list, data, fillHander, select.ignore_click ? select.ignore_click : () => false);
+                        const displayText = text => data.__cefAI ? String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;") : text;
                         iframeMsg("push", {
                             index: GLOBAL.index,
-                            question: r.question,
-                            answer: r.ans,
+                            question: displayText(r.question),
+                            answer: displayText(r.ans),
                             style: r.style
                         });
                         await fillFinish(r);

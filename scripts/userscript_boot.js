@@ -8,6 +8,7 @@
         status: 'idle', attempts: 0, phase: 'boot', error: null, reason: null, failedFile: null
     };
     var timer = null, revision = 0;
+    function now() { return w.performance && w.performance.now ? w.performance.now() : Date.now(); }
     function cancelTimer() {
         if (timer !== null) { w.clearTimeout(timer); timer = null; }
     }
@@ -32,11 +33,13 @@
     };
     w.__cefEvaluateScript = function (file, code) {
         if (!w.__cefInjectionAllowed || blockingFailure()) return;
-        try { (0, eval)(code); }
+        var started = now();
+        try { (0, eval)(code + '\n//# sourceURL=cef-cx/embedded/' + file); }
         catch (e) {
             w.__cefReportUserScriptFailure(file, 'eval',
                 e && e.name === 'SyntaxError' ? 'parse-error' : 'eval-error');
         }
+        finally { state.evalMs = (state.evalMs || 0) + Math.max(0, now() - started); }
     };
     w.__cefRunUserScript = function (run) {
         if (state.status === 'loading' || state.status === 'ready') return state.promise;
@@ -46,6 +49,7 @@
         state.status = 'loading'; state.phase = 'boot';
         state.error = null; state.reason = null; state.failedFile = null;
         state.attempts++;
+        var started = now(), runStarted = 0;
         state.promise = Promise.resolve().then(function () {
             if (ownRevision !== revision) return;
             if (typeof w.__wnBootGM !== 'function') throw new Error('GM runtime missing');
@@ -53,10 +57,13 @@
         }).then(function () {
             if (ownRevision !== revision) return;
             state.phase = 'run';
+            runStarted = now(); state.bootMs = Math.max(0, runStarted - started);
             return run();
         }).then(function () {
             if (ownRevision !== revision) return;
             state.status = 'ready';
+            state.runMs = Math.max(0, now() - runStarted);
+            state.totalMs = Math.max(0, now() - started);
             console.log('[CefHook] userscript entry completed');
         }).catch(function (e) {
             if (ownRevision !== revision) return;

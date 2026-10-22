@@ -18,7 +18,10 @@ function gitInfo(root = ROOT) {
 function sourceInfo(root = ROOT) {
     const files = ['VERSION', 'CMakeLists.txt', 'vcpkg.json', 'vcpkg-configuration.json',
         'tools/build-info.cjs', 'tools/build-environment.ps1', 'tools/build-dll.ps1', 'scripts/clipboard_fix.js',
-        'scripts/userscript_boot.js', 'scripts/diagnostics.js'];
+        'scripts/userscript_boot.js', 'scripts/diagnostics.js',
+        'scripts/dat.js', 'scripts/gm_shim.js', 'scripts/deepseek.js', 'scripts/deepseek_ai_script.js', 'tools/transpile/build.js',
+        'tools/transpile/babel.config.json', 'tools/transpile/package-lock.json',
+        'tools/resource-codec.ps1'];
     function walk(dir) {
         for (const item of fs.readdirSync(path.join(root, dir), { withFileTypes: true })) {
             const name = dir + '/' + item.name;
@@ -28,6 +31,7 @@ function sourceInfo(root = ROOT) {
         }
     }
     ['src', 'cef', 'chromium'].forEach(walk);
+    if (fs.existsSync(path.join(root, 'scripts/assets'))) walk('scripts/assets');
     // Hash actual bytes, including uncommitted/untracked native sources. No timestamps.
     const hashes = files.sort().map(name => [name, sha256(fs.readFileSync(path.join(root, name)))]);
     const version = fs.readFileSync(path.join(root, 'VERSION'), 'utf8').trim();
