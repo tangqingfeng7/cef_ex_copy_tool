@@ -95,7 +95,7 @@ test('DeepSeek DLL multimodal adapter: structure, cost guards, stale results, ca
             mode = 'hold';
             await page.evaluate(() => { window.result = ask(single('cancel')); });
             while (!hold) await new Promise(r => setTimeout(r, 10));
-            await page.evaluate(() => __cefDeepSeek.configure(fixtureConfig));
+            await page.evaluate(() => __cefDeepSeek.configure({ ...fixtureConfig, model: 'changed-model-fixture' }));
             assert.equal((await page.evaluate(() => result)).code, 'CANCELED');
             mode = 'ok'; hold(); hold = null;
         });

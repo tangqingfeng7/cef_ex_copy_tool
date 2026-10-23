@@ -6313,11 +6313,73 @@ var GLOBAL = {
             GM_setValue("tiku_adapter", event.data.tiku_adapter);
         }
     }, false);
+    function legacyEditableFocus() {
+        let doc = document;
+        try {
+            for (let i = 0; i < 12; i++) {
+                let active = doc.activeElement;
+                while (active && active.shadowRoot && active.shadowRoot.activeElement) active = active.shadowRoot.activeElement;
+                if (!active) return false;
+                if (/^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName) || active.isContentEditable) return true;
+                if (!/^(IFRAME|FRAME)$/.test(active.tagName)) return false;
+                if (!active.contentDocument) return true;
+                doc = active.contentDocument;
+            }
+        } catch (_) { return true; }
+        return true;
+    }
+    function setLegacyPanelVisible(visible) {
+        if (legacyEditableFocus()) return false;
+        let doc;
+        try { doc = top.document; } catch (_) { doc = document; }
+        let panel = doc.getElementById(modelId);
+        // AI-only mode intentionally skips the old worker; opening its UI must
+        // not depend on a worker having already created the panel.
+        if (!panel && visible) { showPanel(); panel = doc.getElementById(modelId); }
+        if (!panel) return false;
+        panel.style.display = visible ? 'block' : 'none';
+        if (visible) {
+            GM_setValue('hide', false);
+            const view = doc.defaultView || window;
+            panel.style.boxSizing = 'border-box';
+            panel.style.width = Math.min(321, Math.max(1, view.innerWidth - 20)) + 'px';
+            panel.style.maxWidth = Math.max(1, view.innerWidth - 20) + 'px';
+            panel.style.maxHeight = Math.max(1, view.innerHeight - 20) + 'px';
+            panel.style.overflow = 'auto';
+            panel.classList.add(modelId + '-show');
+            const rect = panel.getBoundingClientRect();
+            const left = Math.max(0, Math.min(Number.isFinite(rect.left) ? rect.left : 30, Math.max(0, view.innerWidth - rect.width)));
+            const y = Math.max(0, Math.min(Number.isFinite(rect.top) ? rect.top : 30, Math.max(0, view.innerHeight - rect.height)));
+            panel.style.left = left + 'px'; panel.style.top = y + 'px';
+            GM_setValue('pos', panel.style.left + ',' + panel.style.top);
+            // Embedded images/iframe can finish loading after the first layout.
+            // Re-clamp their final size instead of leaving the panel off-screen.
+            if (!panel.__cefLegacyBounds) {
+                const clamp = () => {
+                    if (!panel.isConnected || panel.style.display === 'none') return;
+                    panel.style.width = Math.min(321, Math.max(1, view.innerWidth - 20)) + 'px';
+                    panel.style.maxWidth = Math.max(1, view.innerWidth - 20) + 'px';
+                    panel.style.maxHeight = Math.max(1, view.innerHeight - 20) + 'px';
+                    const b = panel.getBoundingClientRect();
+                    panel.style.left = Math.max(0, Math.min(b.left, Math.max(0, view.innerWidth - b.width))) + 'px';
+                    panel.style.top = Math.max(0, Math.min(b.top, Math.max(0, view.innerHeight - b.height))) + 'px';
+                };
+                panel.__cefLegacyBounds = clamp;
+                panel.addEventListener('load', clamp, true);
+                view.addEventListener('resize', clamp);
+                if (view.ResizeObserver) { panel.__cefLegacyObserver = new view.ResizeObserver(clamp); panel.__cefLegacyObserver.observe(panel); }
+                view.requestAnimationFrame(clamp);
+            }
+        }
+        return true;
+    }
+    window.__cefLegacyPanel = Object.freeze({ setVisible: setLegacyPanelVisible });
     $(document).keydown(function(event) {
+        if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey || legacyEditableFocus()) return;
         if (event.keyCode === 38) {
-            $("." + modelId).hide();
+            setLegacyPanelVisible(false);
         } else if (event.keyCode === 40) {
-            $("." + modelId).show();
+            setLegacyPanelVisible(true);
         } else if (event.keyCode === 37) {
             $("." + modelId).hide();
             GM_setValue("hide", true);

@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "ai_native_proxy.h"
 #include "ai_config.h"
+#include "ai_stream_buffer.h"
+#include "hotkeys.h"
 #include "instance_hooks.h"
 
 #include <winhttp.h>
@@ -21,6 +23,9 @@ namespace {
 constexpr wchar_t kProxyPrefix[] = L"/__cef_cx_ai_proxy__/";
 constexpr wchar_t kHealthPath[] = L"/__cef_cx_ai_proxy__/health";
 constexpr wchar_t kChatPath[] = L"/__cef_cx_ai_proxy__/chat/completions";
+constexpr wchar_t kBalancePath[] = L"/__cef_cx_ai_proxy__/user/balance";
+constexpr wchar_t kHotkeysPath[] = L"/__cef_cx_ai_proxy__/hotkeys";
+constexpr wchar_t kCapturePath[] = L"/__cef_cx_ai_proxy__/capture";
 constexpr wchar_t kConfigPath[] = L"/__cef_cx_ai_proxy__/config";
 constexpr size_t kMaxRequestBytes = 12u * 1024u * 1024u;
 constexpr size_t kMaxResponseBytes = 16u * 1024u * 1024u;
@@ -90,12 +95,15 @@ bool AllowedExamHost(const std::wstring& host) {
         EndsWithInsensitive(host, L".chaoxing.com") || EndsWithInsensitive(host, L".edu.cn");
 }
 
-enum class ProxyRoute { None, Health, Chat, Config };
+enum class ProxyRoute { None, Health, Chat, Config, Balance, Capture, Hotkeys };
 
 ProxyRoute RouteForPath(const std::wstring& path) {
     if (path == kHealthPath) return ProxyRoute::Health;
     if (path == kChatPath) return ProxyRoute::Chat;
+    if (path == kHotkeysPath) return ProxyRoute::Hotkeys;
+    if (path == kCapturePath) return ProxyRoute::Capture;
     if (path == kConfigPath) return ProxyRoute::Config;
+    if (path == kBalancePath) return ProxyRoute::Balance;
     return ProxyRoute::None;
 }
 
@@ -104,17 +112,24 @@ bool IsProxyRoute(const std::wstring& requestUrl, const std::wstring& initiator,
     const auto request = ParseUrl(requestUrl);
     const auto source = ParseUrl(initiator);
     if (!request.valid || !source.valid || !request.secure || !source.secure) return false;
-    if (_wcsicmp(request.host.c_str(), source.host.c_str()) != 0 || !AllowedExamHost(source.host)) return false;
+    if (_wcsicmp(request.host.c_str(), source.host.c_str()) != 0 || request.port != source.port || !AllowedExamHost(source.host)) return false;
     const auto route = RouteForPath(request.path);
-    if (route == ProxyRoute::Health) return _wcsicmp(method.c_str(), L"GET") == 0;
-    return (route == ProxyRoute::Chat || route == ProxyRoute::Config) &&
+    if (route == ProxyRoute::Health || route == ProxyRoute::Balance) return _wcsicmp(method.c_str(), L"GET") == 0;
+    return (route == ProxyRoute::Chat || route == ProxyRoute::Config || route == ProxyRoute::Capture || route == ProxyRoute::Hotkeys) &&
         _wcsicmp(method.c_str(), L"POST") == 0;
 }
 
-bool IsAllowedTarget(const std::wstring& target) {
+bool IsProxyRequest(const std::wstring& requestUrl, const std::wstring& initiator,
+                    const std::wstring& sourceFrame, const std::wstring& method, bool navigation, bool download) {
+    return !navigation && !download && IsProxyRoute(requestUrl, initiator.empty() ? sourceFrame : initiator, method);
+}
+
+bool IsAllowedTarget(const std::wstring& target, ProxyRoute route = ProxyRoute::Chat) {
     const auto url = ParseUrl(target);
     if (!url.valid || !url.secure || url.port != INTERNET_DEFAULT_HTTPS_PORT) return false;
     if (_wcsicmp(url.host.c_str(), L"api.deepseek.com") != 0) return false;
+    if (route == ProxyRoute::Balance) return url.path == L"/user/balance";
+    if (route != ProxyRoute::Chat) return false;
     return url.path == L"/chat/completions" || url.path == L"/v1/chat/completions";
 }
 
@@ -131,6 +146,7 @@ std::vector<unsigned char> PostBody(cef_request_t* request) {
     auto* post = request->get_post_data(request);
     if (!post) return body;
     const size_t count = post->get_element_count ? post->get_element_count(post) : 0;
+    if (count > 8) body.resize(kMaxRequestBytes + 1);
     if (count && count <= 8 && post->get_elements) {
         std::vector<cef_post_data_element_t*> elements(count, nullptr);
         size_t actual = count;
@@ -161,13 +177,19 @@ struct ProxyResourceHandler {
     std::atomic<bool> canceled{false};
     std::mutex mutex;
     HINTERNET activeRequest = nullptr;
+    HWND captureWindow = nullptr;
+    int browserId = 0;
+    bool streamWanted = false;
+    std::atomic<bool> streamOpened{false};
+    AiStreamBuffer stream;
+    std::wstring mime = L"application/json";
     std::vector<unsigned char> response;
     size_t offset = 0;
     int status = 502;
     DWORD winError = ERROR_SUCCESS;
     ProxyRoute route = ProxyRoute::None;
 
-    explicit ProxyResourceHandler(ProxyRoute routeKind) : route(routeKind) {
+    explicit ProxyResourceHandler(ProxyRoute routeKind, HWND window = nullptr, int id = 0) : route(routeKind), captureWindow(window), browserId(id) {
         api.base.size = sizeof(api);
         api.base.add_ref = AddRef;
         api.base.release = Release;
@@ -208,7 +230,41 @@ struct ProxyResourceHandler {
         response.assign(json.begin(), json.end());
     }
 
-    void Perform(std::wstring target, std::wstring key, std::vector<unsigned char> body, DWORD timeoutMs) {
+    // Capture ONLY this CEF browser's client surface, never the desktop. The
+    // page crops in CSS coordinates after explicit user selection and previews.
+    bool Capture() {
+        RECT rect{}; DWORD pid = 0;
+        GetWindowThreadProcessId(captureWindow, &pid);
+        if (!captureWindow || pid != GetCurrentProcessId() || !IsWindowVisible(captureWindow) ||
+            !GetClientRect(captureWindow, &rect)) { SetError(ERROR_INVALID_WINDOW_HANDLE); return false; }
+        const int width = rect.right, height = rect.bottom;
+        if (width <= 0 || height <= 0 || width > 4096 || height > 4096 ||
+            static_cast<size_t>(width) * height > (kMaxResponseBytes - 54) / 4) { SetError(ERROR_INSUFFICIENT_BUFFER); return false; }
+        HDC dc = GetDC(captureWindow);
+        if (!dc) { SetError(GetLastError()); return false; }
+        HDC memory = CreateCompatibleDC(dc);
+        HBITMAP bitmap = memory ? CreateCompatibleBitmap(dc, width, height) : nullptr;
+        HGDIOBJ previous = bitmap ? SelectObject(memory, bitmap) : nullptr;
+        // PW_CLIENTONLY | PW_RENDERFULLCONTENT. If unsupported, fail closed;
+        // do not read the global desktop or silently capture other windows.
+        bool ok = bitmap && PrintWindow(captureWindow, memory, 0x00000001 | 0x00000002);
+        if (previous) SelectObject(memory, previous);
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height; info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+        const DWORD pixels = static_cast<DWORD>(width * height * 4);
+        BITMAPFILEHEADER header{}; header.bfType = 0x4d42;
+        header.bfOffBits = sizeof(header) + sizeof(BITMAPINFOHEADER); header.bfSize = header.bfOffBits + pixels;
+        std::vector<unsigned char> bmp(header.bfSize);
+        if (ok) ok = GetDIBits(dc, bitmap, 0, height, bmp.data() + header.bfOffBits, &info, DIB_RGB_COLORS) == height;
+        if (bitmap) DeleteObject(bitmap); if (memory) DeleteDC(memory); ReleaseDC(captureWindow, dc);
+        if (!ok) { SetError(ERROR_NOT_SUPPORTED); return false; }
+        memcpy(bmp.data(), &header, sizeof(header)); memcpy(bmp.data() + sizeof(header), &info.bmiHeader, sizeof(BITMAPINFOHEADER));
+        status = 200; mime = L"image/bmp"; response.swap(bmp); return true;
+    }
+
+    void Perform(std::wstring target, std::wstring key, std::vector<unsigned char> body, DWORD timeoutMs, cef_callback_t* callback) {
         const auto url = ParseUrl(target);
         HINTERNET session = WinHttpOpen(L"cef-cx-copy-tool/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -216,11 +272,9 @@ struct ProxyResourceHandler {
         WinHttpSetTimeouts(session, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
         HINTERNET connect = WinHttpConnect(session, url.host.c_str(), url.port, 0);
         if (!connect) { const DWORD e = GetLastError(); WinHttpCloseHandle(session); SetError(e); return; }
-        HINTERNET request = WinHttpOpenRequest(connect, L"POST", url.path.c_str(), nullptr,
+        HINTERNET request = WinHttpOpenRequest(connect, route == ProxyRoute::Balance ? L"GET" : L"POST", url.path.c_str(), nullptr,
             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-        if (!request) {
-            const DWORD e = GetLastError(); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); SetError(e); return;
-        }
+        if (!request) { const DWORD e = GetLastError(); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); SetError(e); return; }
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (canceled.load()) { WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return; }
@@ -238,30 +292,36 @@ struct ProxyResourceHandler {
                 WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX);
             if (ok) status = static_cast<int>(code);
         }
+        if (ok && streamWanted && !canceled.load()) {
+            wchar_t contentType[256]{}; DWORD size = sizeof(contentType);
+            if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_TYPE, WINHTTP_HEADER_NAME_BY_INDEX,
+                    contentType, &size, WINHTTP_NO_HEADER_INDEX) && wcsstr(contentType, L"text/event-stream")) mime = L"text/event-stream";
+            streamOpened.store(true);
+            if (callback->cont) callback->cont(callback); // Headers first, chunks follow.
+        }
         std::vector<unsigned char> data;
+        size_t total = 0; DWORD explicitError = ERROR_SUCCESS;
         while (ok && !canceled.load()) {
             DWORD available = 0;
             if (!WinHttpQueryDataAvailable(request, &available)) { ok = FALSE; break; }
             if (!available) break;
-            if (available > kMaxResponseBytes - data.size()) { SetError(ERROR_INSUFFICIENT_BUFFER); ok = FALSE; break; }
-            const size_t old = data.size();
-            data.resize(old + available);
-            DWORD read = 0;
-            if (!WinHttpReadData(request, data.data() + old, available, &read)) { ok = FALSE; break; }
-            data.resize(old + read);
+            available = (std::min)(available, static_cast<DWORD>(65536));
+            if (available > kMaxResponseBytes - total) { explicitError = ERROR_INSUFFICIENT_BUFFER; ok = FALSE; break; }
+            std::vector<unsigned char> chunk(available); DWORD read = 0;
+            if (!WinHttpReadData(request, chunk.data(), available, &read)) { ok = FALSE; break; }
+            if (!read) break;
+            total += read;
+            if (streamOpened.load()) { if (!stream.push(chunk.data(), read)) { explicitError = ERROR_INSUFFICIENT_BUFFER; ok = FALSE; break; } }
+            else data.insert(data.end(), chunk.begin(), chunk.begin() + read);
         }
-        const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+        const DWORD error = ok ? ERROR_SUCCESS : explicitError ? explicitError : GetLastError();
         bool closeRequest = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            closeRequest = activeRequest == request;
-            activeRequest = nullptr;
-        }
+        { std::lock_guard<std::mutex> lock(mutex); closeRequest = activeRequest == request; activeRequest = nullptr; }
         if (closeRequest) WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
+        WinHttpCloseHandle(connect); WinHttpCloseHandle(session);
         if (canceled.load()) return;
-        if (!ok) SetError(error ? error : ERROR_GEN_FAILURE);
+        if (streamOpened.load()) stream.finish(!ok);
+        else if (!ok) SetError(error ? error : ERROR_GEN_FAILURE);
         else response.swap(data);
     }
 
@@ -275,11 +335,25 @@ struct ProxyResourceHandler {
             const bool saved = !body.empty() && body.size() <= 65536 &&
                 SaveAiConfigFile(std::string(body.begin(), body.end()));
             self->status = saved ? 200 : 500;
-            const char* json = saved ? "{\"saved\":true}" : "{\"saved\":false}";
-            self->response.assign(json, json + strlen(json));
+            const DWORD error = saved ? ERROR_SUCCESS : body.empty() || body.size() > 65536 ? ERROR_INVALID_DATA : GetLastError();
+            const std::string json = saved ? "{\"saved\":true}" : "{\"saved\":false,\"win32\":" + std::to_string(error) + "}";
+            self->response.assign(json.begin(), json.end());
             *handleRequest = 1;
             return 1;
         }
+        if (self->route == ProxyRoute::Hotkeys) {
+            const auto body = PostBody(request);
+            const bool ok = body.size() <= 256 && AiHotkeys::Update(self->browserId, std::string(body.begin(), body.end()));
+            self->status = ok ? 200 : 400;
+            const std::string json = ok ? "{\"updated\":true}" : "{\"updated\":false}";
+            self->response.assign(json.begin(), json.end()); *handleRequest = 1; return 1;
+        }
+        if (self->route == ProxyRoute::Capture) {
+            if (Header(request, L"X-Cef-Cx-Ai-Capture") != L"1") { self->status = 400; }
+            else self->Capture();
+            *handleRequest = 1; return 1;
+        }
+        self->streamWanted = self->route == ProxyRoute::Chat && Header(request, L"X-Cef-Cx-Ai-Stream") == L"1";
         const std::wstring target = Header(request, L"X-Cef-Cx-Ai-Target");
         const std::wstring key = Header(request, L"X-Cef-Cx-Ai-Key");
         const std::wstring timeoutText = Header(request, L"X-Cef-Cx-Ai-Timeout");
@@ -290,7 +364,9 @@ struct ProxyResourceHandler {
             const unsigned long parsed = wcstoul(timeoutText.c_str(), &end, 10);
             if (end && !*end && parsed >= 5000 && parsed <= 180000) timeoutMs = parsed;
         }
-        if (!IsAllowedTarget(target) || key.empty() || key.size() > 8192 || body.empty() || body.size() > kMaxRequestBytes) {
+        const bool invalidBody = self->route == ProxyRoute::Balance ? !body.empty() : body.empty() || body.size() > kMaxRequestBytes;
+        if (!IsAllowedTarget(target, self->route) || key.empty() || key.size() > 8192 ||
+            key.find_first_of(L"\r\n") != std::wstring::npos || invalidBody) {
             self->status = 400;
             const char invalid[] = "{\"cefCxProxyError\":{\"code\":\"INVALID_REQUEST\"}}";
             self->response.assign(invalid, invalid + sizeof(invalid) - 1);
@@ -302,8 +378,8 @@ struct ProxyResourceHandler {
         AddRef(&self->api.base);
         try {
             std::thread([self, callback, target, key, body = std::move(body), timeoutMs]() mutable {
-                self->Perform(target, key, std::move(body), timeoutMs);
-                if (!self->canceled.load() && callback->cont) callback->cont(callback);
+                self->Perform(target, key, std::move(body), timeoutMs, callback);
+                if (!self->streamOpened.load() && !self->canceled.load() && callback->cont) callback->cont(callback);
                 if (callback->base.release) callback->base.release(&callback->base);
                 Release(&self->api.base);
             }).detach();
@@ -321,17 +397,17 @@ struct ProxyResourceHandler {
         auto* self = Self(api);
         if (response->set_status) response->set_status(response, self->status);
         if (response->set_mime_type) {
-            const std::wstring mime = L"application/json";
-            auto value = CefView(mime);
+            auto value = CefView(self->mime);
             response->set_mime_type(response, &value);
         }
-        if (responseLength) *responseLength = static_cast<int64>(self->response.size());
+        if (responseLength) *responseLength = self->streamOpened.load() ? -1 : static_cast<int64>(self->response.size());
     }
 
     static int CEF_CALLBACK Skip(cef_resource_handler_t* api, int64 bytesToSkip, int64* bytesSkipped,
                                  cef_resource_skip_callback_t*) {
         auto* self = Self(api);
         const size_t remaining = self->response.size() - (std::min)(self->offset, self->response.size());
+        if (bytesToSkip < 0 || self->streamOpened.load()) { if (bytesSkipped) *bytesSkipped = -2; return 0; }
         const size_t count = static_cast<size_t>((std::min)(bytesToSkip, static_cast<int64>(remaining)));
         self->offset += count;
         if (bytesSkipped) *bytesSkipped = static_cast<int64>(count);
@@ -339,8 +415,9 @@ struct ProxyResourceHandler {
     }
 
     static int CEF_CALLBACK Read(cef_resource_handler_t* api, void* output, int bytesToRead,
-                                 int* bytesRead, cef_resource_read_callback_t*) {
+                                 int* bytesRead, cef_resource_read_callback_t* callback) {
         auto* self = Self(api);
+        if (self->streamOpened.load()) return self->stream.read(output, bytesToRead, bytesRead, callback);
         if (!bytesRead || !output || bytesToRead <= 0) return 0;
         const size_t remaining = self->response.size() - (std::min)(self->offset, self->response.size());
         const size_t count = (std::min)(remaining, static_cast<size_t>(bytesToRead));
@@ -354,6 +431,7 @@ struct ProxyResourceHandler {
     static void CEF_CALLBACK Cancel(cef_resource_handler_t* api) {
         auto* self = Self(api);
         self->canceled.store(true);
+        self->stream.cancel();
         std::lock_guard<std::mutex> lock(self->mutex);
         if (self->activeRequest) WinHttpCloseHandle(self->activeRequest);
         self->activeRequest = nullptr;
@@ -365,7 +443,9 @@ struct ProxyResourceRequestHandler {
     std::atomic<long> refs{1};
     ProxyRoute route = ProxyRoute::None;
 
-    explicit ProxyResourceRequestHandler(ProxyRoute routeKind) : route(routeKind) {
+    HWND captureWindow = nullptr;
+    int browserId = 0;
+    explicit ProxyResourceRequestHandler(ProxyRoute routeKind, HWND window = nullptr, int id = 0) : route(routeKind), captureWindow(window), browserId(id) {
         api.base.size = sizeof(api);
         api.base.add_ref = AddRef;
         api.base.release = Release;
@@ -381,7 +461,7 @@ struct ProxyResourceRequestHandler {
     static int CEF_CALLBACK HasAtLeastOneRef(cef_base_ref_counted_t* base) { return Self(base)->refs.load() > 0; }
     static cef_resource_handler_t* CEF_CALLBACK GetResourceHandler(cef_resource_request_handler_t* api,
         cef_browser_t*, cef_frame_t*, cef_request_t*) {
-        return &((new ProxyResourceHandler(Self(api)->route))->api);
+        return &((new ProxyResourceHandler(Self(api)->route, Self(api)->captureWindow, Self(api)->browserId))->api);
     }
 };
 
@@ -391,11 +471,24 @@ cef_resource_request_handler_t* CEF_CALLBACK HookGetResourceRequestHandler(
     const cef_string_t* requestInitiator, int* disableDefaultHandling) {
     const std::wstring url = request && request->get_url ? TakeUserfree(request->get_url(request)) : L"";
     const std::wstring method = request && request->get_method ? TakeUserfree(request->get_method(request)) : L"";
-    const std::wstring initiator = requestInitiator && requestInitiator->str ?
+    std::wstring initiator = requestInitiator && requestInitiator->str ?
         std::wstring(reinterpret_cast<const wchar_t*>(requestInitiator->str), requestInitiator->length) : L"";
-    if (IsProxyRoute(url, initiator, method)) {
+    // Older hosts can omit the initiator. Use only the CEF-owned source frame
+    // URL in that case; never replace a provided foreign/opaque origin.
+    if (initiator.empty() && frame && frame->get_url && (!frame->is_valid || frame->is_valid(frame)))
+        initiator = TakeUserfree(frame->get_url(frame));
+    const auto selectedRoute = RouteForPath(ParseUrl(url).path);
+    // A trusted subframe must not capture a different top-level page's pixels.
+    const bool captureMainFrame = (selectedRoute != ProxyRoute::Capture && selectedRoute != ProxyRoute::Hotkeys) ||
+        (frame && frame->is_main && frame->is_main(frame));
+    if (captureMainFrame && IsProxyRequest(url, initiator, L"", method, isNavigation != 0, isDownload != 0)) {
         if (disableDefaultHandling) *disableDefaultHandling = 1;
-        return &((new ProxyResourceRequestHandler(RouteForPath(ParseUrl(url).path)))->api);
+        HWND window = nullptr;
+        if (browser && browser->get_host) {
+            auto* host = browser->get_host(browser);
+            if (host) { if (host->get_window_handle) window = host->get_window_handle(host); if (host->base.release) host->base.release(&host->base); }
+        }
+        return &((new ProxyResourceRequestHandler(RouteForPath(ParseUrl(url).path), window, browser && browser->get_identifier ? browser->get_identifier(browser) : 0))->api);
     }
     auto original = InstanceHooks<cef_request_handler_t>::original(self).get_resource_request_handler;
     return original ? original(self, browser, frame, request, isNavigation, isDownload,
@@ -440,4 +533,18 @@ bool IsAllowedAiProxyRouteForTest(const std::wstring& requestUrl,
 
 bool IsAllowedDeepSeekTargetForTest(const std::wstring& target) {
     return IsAllowedTarget(target);
+}
+
+bool IsAllowedDeepSeekBalanceTargetForTest(const std::wstring& target) {
+    return IsAllowedTarget(target, ProxyRoute::Balance);
+}
+
+bool IsAllowedAiProxySourceForTest(const std::wstring& target, const std::wstring& initiator,
+                                  const std::wstring& frame, const std::wstring& method, bool navigation, bool download) {
+    return IsProxyRequest(target, initiator, frame, method, navigation, download);
+}
+
+bool CaptureBrowserClientForTest(void* window, std::vector<unsigned char>& bitmap) {
+    ProxyResourceHandler handler(ProxyRoute::Capture, static_cast<HWND>(window));
+    const bool ok = handler.Capture(); bitmap = handler.response; return ok;
 }

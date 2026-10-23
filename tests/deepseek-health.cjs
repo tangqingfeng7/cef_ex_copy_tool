@@ -34,7 +34,7 @@ test('connection button accepts valid completion without answer schema, saving o
         assert.equal(requests[0].max_tokens, 16);
         assert.equal(requests[0].messages.length, 1);
         assert.equal(requests[0].messages[0].content, 'Reply OK only.');
-        assert.equal(await page.evaluate(() => __cefDeepSeek.enabled()), false, 'probe does not save draft enabled checkbox');
+        assert.equal(await page.evaluate(() => __cefDeepSeek.enabled()), true, 'explicit checkbox change enables AI; probe itself does not change it');
         assert.equal(await page.evaluate(() => __cefDeepSeek.status().configured), false, 'probe does not persist draft key');
         assert.equal(await page.evaluate(() => __cefDeepSeek.status().probeRequests), 1);
         assert.equal(await page.evaluate(() => __cefDeepSeek.status().requests), 0);
@@ -46,7 +46,7 @@ test('connection button accepts valid completion without answer schema, saving o
         await host.locator('#opacity').fill('100');
         await host.evaluate(el => { el.style.left = '240px'; el.style.top = '120px'; });
         await page.screenshot({ path: path.join(root, 'out/deepseek-minimal-preview.png') });
-        await host.locator('#advanced').locator('summary').click();
+        await host.locator('#advanced > summary').click();
         assert.equal(await host.locator('#model').isVisible(), true);
         assert.equal(await host.locator('#model').inputValue(), 'deepseek-flash');
         await page.keyboard.press('Control+g'); await host.waitFor({ state: 'hidden' });

@@ -17,6 +17,8 @@
 #include "frame_documents.h"
 #include "ai_config.h"
 #include "ai_native_proxy.h"
+#include "hotkeys.h"
+#include <bcrypt.h>
 
 PVOID g_cef_browser_host_create_browser = nullptr;
 // 诊断开关：解除切屏限制（Win+Tab/Alt+Tab）的 SetWindowsHookEx 挂钩。
@@ -255,8 +257,8 @@ void SetAsPopup(cef_window_info_t* window_info) {
     window_info->height = CW_USEDEFAULT;
 }
 
-static bool ToggleDeepSeekPanel(struct _cef_browser_t* browser);
-static bool ToggleDeepSeekAnswering(struct _cef_browser_t* browser);
+static void ShowLegacyPanel(struct _cef_browser_t* browser, bool visible);
+static bool AssistantShortcut(struct _cef_browser_t* browser, AiHotkeys::Action action, const std::string& combo);
 
 // Intercept before renderer dispatch: works while a child editor iframe owns
 // focus and prevents native + DOM handlers from toggling the panel twice.
@@ -264,13 +266,21 @@ int CEF_CALLBACK hook_cef_on_pre_key_event(
     struct _cef_keyboard_handler_t* self, struct _cef_browser_t* browser,
     const struct _cef_key_event_t* event, cef_event_handle_t os_event,
     int* is_keyboard_shortcut) {
-    if (event && event->type == KEYEVENT_RAWKEYDOWN && event->windows_key_code == 'G'
-        && (event->modifiers & EVENTFLAG_CONTROL_DOWN)
-        && !(event->modifiers & (EVENTFLAG_ALT_DOWN | EVENTFLAG_COMMAND_DOWN))) {
-        // Windows lParam bit 30 marks an auto-repeat, not another press.
-        const bool pauseShortcut = (event->modifiers & EVENTFLAG_SHIFT_DOWN) != 0;
-        if ((static_cast<unsigned int>(event->native_key_code) & (1u << 30)) ||
-            (pauseShortcut ? ToggleDeepSeekAnswering(browser) : ToggleDeepSeekPanel(browser))) {
+    if (event && event->type == KEYEVENT_RAWKEYDOWN &&
+        (event->windows_key_code == VK_UP || event->windows_key_code == VK_DOWN) &&
+        !(event->modifiers & (EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN | EVENTFLAG_SHIFT_DOWN | EVENTFLAG_COMMAND_DOWN)) &&
+        !(static_cast<unsigned int>(event->native_key_code) & (1u << 30))) {
+        // Dispatch to the main frame even when a child frame owns focus. The
+        // JS focus guard protects caret movement. Never consume arrow keys.
+        ShowLegacyPanel(browser, event->windows_key_code == VK_DOWN);
+    }
+    if (browser && event && event->type == KEYEVENT_RAWKEYDOWN && !(event->modifiers & EVENTFLAG_COMMAND_DOWN)) {
+        const int modifiers = ((event->modifiers & EVENTFLAG_CONTROL_DOWN) ? AiHotkeys::Control : 0) |
+            ((event->modifiers & EVENTFLAG_ALT_DOWN) ? AiHotkeys::Alt : 0) | ((event->modifiers & EVENTFLAG_SHIFT_DOWN) ? AiHotkeys::Shift : 0);
+        const auto bindings = AiHotkeys::Get(browser->get_identifier ? browser->get_identifier(browser) : 0);
+        const auto action = AiHotkeys::Match(bindings, event->windows_key_code, modifiers);
+        if (action != AiHotkeys::None && ((static_cast<unsigned int>(event->native_key_code) & (1u << 30)) ||
+                AssistantShortcut(browser, action, bindings[action].combo))) {
             if (is_keyboard_shortcut) *is_keyboard_shortcut = 1;
             return 1;
         }
@@ -361,24 +371,50 @@ static void ExecJs(struct _cef_frame_t* frame, const std::wstring& js,
     }
 }
 
-static bool ToggleDeepSeekPanel(struct _cef_browser_t* browser) {
+static bool AssistantShortcut(struct _cef_browser_t* browser, AiHotkeys::Action action, const std::string& combo) {
     if (!browser || !browser->get_main_frame || !func_cef_string_from_ptr) return false;
-    auto* frame = browser->get_main_frame(browser); // Returned with one reference.
-    if (!frame) return false;
-    const bool ready = FrameCanExecute(frame);
-    if (ready) ExecJs(frame, L"if(window.__cefDeepSeek&&window.__cefDeepSeek.toggleSettings)window.__cefDeepSeek.toggleSettings();", L"cef-cx/ai-hotkey.js");
-    if (frame->base.release) frame->base.release(&frame->base);
+    const std::wstring wideCombo(combo.begin(), combo.end()); // Strictly parsed ASCII binding.
+    auto* main = browser->get_main_frame(browser);
+    if (!main) return false;
+    const bool ready = FrameCanExecute(main);
+    if (ready && action == AiHotkeys::Selection) {
+        unsigned char bytes[16]{};
+        if (BCryptGenRandom(nullptr, bytes, sizeof(bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+            if (main->base.release) main->base.release(&main->base); return false;
+        }
+        const wchar_t hex[] = L"0123456789abcdef"; std::wstring token;
+        for (auto value : bytes) { token += hex[value >> 4]; token += hex[value & 15]; }
+        // Arm the main-frame closure with a one-use token before asking the
+        // focused frame for text. Unsolicited iframe messages cannot auto-send.
+        ExecJs(main, L"if(window.__cefDeepSeek)window.__cefDeepSeek.prepareSelection('" + token + L"','" + wideCombo + L"');", L"cef-cx/selection-arm.js");
+        auto* focused = browser->get_focused_frame ? browser->get_focused_frame(browser) : browser->get_main_frame(browser);
+        if (focused) {
+            const std::wstring body = LR"JS(
+                if(window.__cefDeepSeek&&window.__cefDeepSeek.recordHotkey(combo))return;
+                var e=document.activeElement,t='';for(var i=0;e&&e.shadowRoot&&e.shadowRoot.activeElement&&i<8;i++)e=e.shadowRoot.activeElement;if(e&&e.type==='password')return;
+                if(e&&typeof e.selectionStart==='number')t=e.value.slice(e.selectionStart,e.selectionEnd);
+                if(!t)t=String(window.getSelection()||'');
+                window.top.postMessage({type:'cef-cx-selection-draft',text:t.slice(0,32000),token:token},'*');
+            )JS";
+            ExecJs(focused, L"(function(token,combo){" + body + L"})('" + token + L"','" + wideCombo + L"');", L"cef-cx/selection-hotkey.js");
+            if (focused->base.release) focused->base.release(&focused->base);
+        }
+    } else if (ready) {
+        const char* name = AiHotkeys::Name(action); const std::string label(name);
+        ExecJs(main, L"if(window.__cefDeepSeek)window.__cefDeepSeek.handleHotkey('" + std::wstring(label.begin(), label.end()) + L"','" + wideCombo + L"');", L"cef-cx/ai-hotkey.js");
+    }
+    if (main->base.release) main->base.release(&main->base);
     return ready;
 }
 
-static bool ToggleDeepSeekAnswering(struct _cef_browser_t* browser) {
-    if (!browser || !browser->get_main_frame || !func_cef_string_from_ptr) return false;
+static void ShowLegacyPanel(struct _cef_browser_t* browser, bool visible) {
+    if (!browser || !browser->get_main_frame || !func_cef_string_from_ptr) return;
     auto* frame = browser->get_main_frame(browser);
-    if (!frame) return false;
-    const bool ready = FrameCanExecute(frame);
-    if (ready) ExecJs(frame, L"if(window.__cxUpstreamAI&&window.__cxUpstreamAI.togglePause)window.__cxUpstreamAI.togglePause();", L"cef-cx/ai-pause-hotkey.js");
+    if (!frame) return;
+    if (FrameCanExecute(frame)) ExecJs(frame,
+        visible ? L"if(window.__cefLegacyPanel)window.__cefLegacyPanel.setVisible(true);" :
+                  L"if(window.__cefLegacyPanel)window.__cefLegacyPanel.setVisible(false);", L"cef-cx/legacy-hotkey.js");
     if (frame->base.release) frame->base.release(&frame->base);
-    return ready;
 }
 
 // 将宽字符串先转 UTF-8，再做 base64 编码（输出仅含 ASCII，拼接时无需转义）。
@@ -481,7 +517,7 @@ static void InjectCrackShim(struct _cef_frame_t* frame) {
     std::wstring script = L"window.__cefBuildInfo=" + std::wstring(kBuildRecord + kBuildRecordPrefix) +
         L";window.__cefRuntimeInfo=" + RuntimeVersionJson() +
         L";window.__cefNativeInfo=" + NativeDiagnosticsJson() +
-        L";window.__cefNativeAiProxy=Object.freeze({version:1,deepseekOnly:true,configWrite:true});\n";
+        L";window.__cefNativeAiProxy=Object.freeze({version:1,deepseekOnly:true,configWrite:true,balanceRead:true,captureRead:true,streamRead:true,hotkeysWrite:true});\n";
 #if !ENABLE_USERSCRIPT
     script += L"window.__cefUserScriptState={status:'disabled',reason:'build-option'};\n";
 #else

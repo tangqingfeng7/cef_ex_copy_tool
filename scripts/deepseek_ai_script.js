@@ -58,16 +58,23 @@
     let rerunForced = false;
     let lastRequestedSignature = '';
     let imageLoadListenerInstalled = false;
-    let answeringPaused = false;
+    let answeringPaused = window.__cefDeepSeek.status().answeringPaused === true;
     let pauseWaiters = [];
+    let runEpoch = 0;
+    const failedQuestions = new Map();
 
-    function setAnsweringPaused(paused) {
+    function setAnsweringPaused(paused, persist = true) {
+        if (answeringPaused === !!paused) return answeringPaused;
         answeringPaused = !!paused;
+        if (persist && window.__cefDeepSeek.rememberPause) window.__cefDeepSeek.rememberPause(answeringPaused);
         if (!answeringPaused) {
             const waiters = pauseWaiters.splice(0);
             waiters.forEach(resolve => resolve());
             reportStatus('继续逐题答题…', 'success');
-            scheduleAutoAnswer(true);
+            // A previous round can still be waiting at the pause gate after
+            // AI was disabled/re-enabled. Queue through the signature guard;
+            // the obsolete round will exit before the new timer runs.
+            scheduleAutoAnswer(false);
         } else {
             reportStatus(isProcessing ? '已暂停 · 当前题写入前等待继续' : '已暂停答题', 'success');
         }
@@ -88,16 +95,18 @@
 
     function sleep(ms) { return ms > 0 ? new Promise(resolve => setTimeout(resolve, ms)) : Promise.resolve(); }
 
-    async function waitBetweenQuestions(ms, nextIndex, total) {
-        let remaining = Math.max(0, Number(ms) || 0);
-        while (remaining > 0) {
+    async function waitBetweenQuestions(ms, nextIndex, total, epoch) {
+        let elapsed = 0;
+        while (true) {
             await waitForAnsweringPermission();
-            if (!window.__cefDeepSeek.enabled()) return false;
+            if (!window.__cefDeepSeek.enabled() || epoch !== runEpoch) return false;
+            const remaining = Math.max(0, answerDelayMs() - elapsed);
+            if (!remaining) break;
             const seconds = (remaining / 1000).toFixed(1).replace(/\.0$/, '');
-            reportStatus(`本题已填入 · ${seconds} 秒后处理第 ${nextIndex}/${total} 题…`);
+            reportStatus(`本题处理结束 · ${seconds} 秒后处理第 ${nextIndex}/${total} 题…`);
             const step = Math.min(remaining, 200);
             await sleep(step);
-            remaining -= step;
+            elapsed += step;
         }
         return window.__cefDeepSeek.enabled();
     }
@@ -136,7 +145,7 @@
     }
 
     function scheduleAutoAnswer(force, delay = 0) {
-        if (!window.__cefDeepSeek.enabled()) return;
+        if (!window.__cefDeepSeek.enabled() || !window.__cefDeepSeek.status().configured) return;
         observeQuestions();
         if (autoTimer) clearTimeout(autoTimer);
         autoTimer = setTimeout(() => {
@@ -204,9 +213,23 @@
         // container while the actual stem explicitly says [填空题]. The stem
         // marker is more specific than the host container metadata.
         if (/\[\s*填空题\s*\]|【\s*填空题\s*】/.test(titleText)) return { name: '填空题', code: 2 };
-        const named = question.querySelector('input[name^="type"],input[name^="answertype"],input[class^="que-type"]');
-        const parsed = named && Number(named.value);
-        if (Number.isFinite(parsed)) {
+        const heading = titleText.replace(/^\s*(?:第?\d+|[一二三四五六七八九十]+)\s*[.、．:：]?\s*/, '');
+        const labels = [
+            ['多选题', '多选题', 1], ['单选题', '单选题', 0], ['判断题', '判断题', 3], ['填空题', '填空题', 2],
+            ['简答题', '简答题', 4], ['问答题', '简答题', 4], ['论述题', '简答题', 4], ['编程题', '简答题', 4], ['程序设计题', '简答题', 4]
+        ];
+        for (const [label, name, code] of labels) {
+            if (new RegExp('^[（(【\\[]?\\s*' + label).test(heading)) return { name, code };
+        }
+        // Empty strings coerce to 0; editor toolbar fields such as typeface are
+        // not question metadata. Never let either silently select single-choice.
+        const candidates = Array.from(question.querySelectorAll('input[name^="type"],input[name^="answertype"],input[class*="que-type"]'));
+        for (const named of candidates) {
+            const validName = /^(?:type|answertype)(?:\d+|_\d+|\[\d+\])?$/.test(named.name || '');
+            const validClass = Array.from(named.classList).some(value => /^que-type(?:-\d+)?$/.test(value));
+            const value = String(named.value || '').trim();
+            if ((!validName && !validClass) || !/^\d+$/.test(value)) continue;
+            const parsed = Number(value);
             if (parsed === 0 || parsed === 66) return { name: '单选题', code: parsed };
             if (parsed === 1) return { name: '多选题', code: 1 };
             if (parsed === 2) return { name: '填空题', code: 2 };
@@ -215,9 +238,10 @@
         }
         if (titleText.includes('多选题')) return { name: '多选题', code: 1 };
         if (titleText.includes('判断题')) return { name: '判断题', code: 3 };
+        if (titleText.includes('简答题')) return { name: '简答题', code: 4 };
         if (titleText.includes('填空题') || blankTargets.length > 1) return { name: '填空题', code: 2 };
-        if (titleText.includes('简答题') || blankTargets.length === 1) return { name: '简答题', code: 4 };
-        return { name: '单选题', code: optionNodes.length > 0 ? 0 : 4 };
+        if (blankTargets.length === 1 || !optionNodes.length) return { name: '简答题', code: 4 };
+        return { name: '单选题', code: 0 };
     }
 
     function buildQuestionModel(question, index) {
@@ -270,14 +294,15 @@
     // 初始化脚本
     function initScript() {
         document.addEventListener('cef-ai-invalidated', function () {
+            runEpoch++; failedQuestions.clear();
             window.aiAnswersData = null; window.copiedAIAnswer = null; window.copiedAIContext = null;
             document.body.style.cursor = 'default';
         });
         document.addEventListener('cef-ai-config-changed', function () {
             window.aiAnswersData = null; window.copiedAIAnswer = null; window.copiedAIContext = null;
             lastRequestedSignature = '';
-            if (!window.__cefDeepSeek.enabled()) setAnsweringPaused(false);
-            else scheduleAutoAnswer(true);
+            setAnsweringPaused(window.__cefDeepSeek.status().answeringPaused === true, false);
+            if (window.__cefDeepSeek.enabled()) scheduleAutoAnswer(true);
         });
         ;
 
@@ -508,13 +533,14 @@
     /**
      * 获取所有题目的AI答案
      */
-    async function fetchAllAnswers() {
+    async function fetchAllAnswers(options = {}) {
         if (!window.__cefDeepSeek.enabled()) return;
         ;
 
         // 检查是否正在处理中
         if (isProcessing) {
-            rerunRequested = true;
+            if (!options.failedOnly) rerunRequested = true;
+            else reportStatus('当前题正在处理，请等待本轮结束后再重试', 'error');
             return;
         }
 
@@ -537,9 +563,14 @@
         ;
 
         // 使用局部变量存储答案数据
-        const answersData = {};
+        const epoch = runEpoch;
+        const answersData = options.failedOnly ? Object.assign({}, window.aiAnswersData || {}) : {};
 
-        const questions = Array.from(document.querySelectorAll('div.questionLi'));
+        const allQuestions = Array.from(document.querySelectorAll('div.questionLi'));
+        const questions = options.failedOnly ? allQuestions.filter(question => failedQuestions.has(question)) : allQuestions;
+        if (options.failedOnly && !questions.length) {
+            reportStatus('没有可重试的失败题'); isProcessing = false; return;
+        }
         if (questions.length === 0) {
             reportStatus('已启用 · 等待题目加载…');
             observeQuestions();
@@ -547,7 +578,7 @@
             return;
         }
 
-        clearProgress();
+        if (!options.failedOnly) clearProgress();
         reportStatus(`准备逐题识别，共 ${questions.length} 道…`);
 
         try {
@@ -556,52 +587,69 @@
             // Strictly await and fill one question before the next request starts.
             for (let index = 0; index < questions.length; index++) {
                 await waitForAnsweringPermission();
-                if (!window.__cefDeepSeek.enabled()) break;
+                if (!window.__cefDeepSeek.enabled() || epoch !== runEpoch) break;
                 const question = questions[index];
-                const model = buildQuestionModel(question, index);
+                const originalIndex = allQuestions.indexOf(question);
+                const model = buildQuestionModel(question, originalIndex);
                 if (!model) continue;
+                if (options.failedOnly) model.data.__cefAIRetry = true;
                 const questionText = compactQuestion(model.titleText);
                 const imageText = model.imageCount ? ` · ${model.imageCount} 张题图` : '';
                 reportStatus(`正在处理第 ${index + 1}/${questions.length} 题…`);
-                reportProgress({ key: model.key, index: index + 1, question: questionText,
+                reportProgress({ key: model.key, root: question, index: originalIndex + 1, question: questionText,
                     answer: `正在识别${imageText}…`, state: 'pending' });
                 try {
                     const result = await fetchQuestionAnswer(model);
                     const answerData = {
                         answer: result.answer, answers: result.answers, root: question, validate: result.validate,
                         type: model.type.name, typeCode: model.type.code, targets: model.blankTargets,
-                        progressKey: model.key, progressIndex: index + 1, questionText, needsReview: result.needsReview
+                        progressKey: model.key, progressIndex: originalIndex + 1, questionText, needsReview: result.needsReview
                     };
                     answersData[model.key] = answerData;
                     window.aiAnswersData = answersData;
-                    reportProgress({ key: model.key, index: index + 1, question: questionText,
+                    reportProgress({ key: model.key, root: question, index: originalIndex + 1, question: questionText,
                         answer: `已识别：${result.answer}${result.needsReview ? '（建议核对）' : ''}`, state: 'pending' });
                     await waitForAnsweringPermission();
-                    if (!window.__cefDeepSeek.enabled()) break;
+                    if (!window.__cefDeepSeek.enabled() || epoch !== runEpoch) break;
                     if (result.validate && result.validate()) {
                         const currentFill = fillAnswersFromAI({ [model.key]: answerData });
                         filledCount += currentFill.filledCount;
                         matchedCount += currentFill.matchedCount;
+                        if (currentFill.matchedCount || answerData.skippedExisting) failedQuestions.delete(question);
+                        else {
+                            answerData.writeFailed = true; answerData.message = '页面控件回读不一致，未确认写入';
+                            failedQuestions.set(question, true);
+                        }
+                    } else {
+                        answerData.writeFailed = true; answerData.message = '题目或输入已变化';
+                        failedQuestions.set(question, true);
+                        reportProgress({ key: model.key, root: question, index: originalIndex + 1, question: questionText, answer: '未填入：题目或输入已变化', state: 'error' });
                     }
                 } catch (error) {
+                    if (epoch !== runEpoch) break;
+                    failedQuestions.set(question, true);
                     answersData[model.key] = {
                         error: true, message: error.message || '请求失败', type: model.type.name,
-                        progressKey: model.key, progressIndex: index + 1, questionText
+                        progressKey: model.key, progressIndex: originalIndex + 1, questionText
                     };
-                    reportProgress({ key: model.key, index: index + 1, question: questionText,
+                    reportProgress({ key: model.key, root: question, index: originalIndex + 1, question: questionText,
                         answer: `失败：${error.message || '请求失败'}`, state: 'error' });
                 }
-                if (index < questions.length - 1 && !await waitBetweenQuestions(answerDelayMs(), index + 2, questions.length)) break;
+                if (index < questions.length - 1 && !await waitBetweenQuestions(answerDelayMs(), index + 2, questions.length, epoch)) break;
             }
 
+            if (epoch !== runEpoch) return;
             const allResults = Object.values(answersData);
-            const failedResults = allResults.filter(item => item && item.error);
+            const failedResults = allResults.filter(item => item && (item.error || item.writeFailed));
+            const skippedCount = allResults.filter(item => item && item.skippedExisting).length;
             window.aiAnswersData = answersData;
             const successCount = allResults.length - failedResults.length;
             if (matchedCount > 0 && failedResults.length === 0) {
                 reportStatus(`逐题处理完成：${matchedCount} 道，写入 ${filledCount} 项 · 请提交前核对`, 'success');
             } else if (matchedCount > 0) {
                 reportStatus(`已逐题处理 ${matchedCount} 道，写入 ${filledCount} 项；${failedResults.length} 道失败`, 'error');
+            } else if (skippedCount && !failedResults.length) {
+                reportStatus(`按覆盖策略保留 ${skippedCount} 道已有答案`, 'success');
             } else if (successCount > 0) {
                 reportStatus(`已得到 ${successCount} 道答案，但页面控件未匹配`, 'error');
             } else if (failedResults.length > 0) {
@@ -660,7 +708,20 @@
     function editorText(value) {
         const probe = document.createElement('div');
         probe.innerHTML = String(value == null ? '' : value);
-        return (probe.textContent || '').replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n').trim();
+        return editorNodeText(probe);
+    }
+
+    function editorNodeText(node) {
+        function read(current) {
+            if (current.nodeType === 3) return current.nodeValue || '';
+            if (current.nodeType !== 1) return '';
+            if (current.tagName === 'BR') return '\n';
+            const text = Array.from(current.childNodes).map(read).join('');
+            return /^(P|DIV|LI|PRE|TR)$/.test(current.tagName) && !text.endsWith('\n') ? text + '\n' : text;
+        }
+        // textContent drops <br> and paragraph boundaries. innerText would
+        // instead collapse indentation; walk the DOM to retain both.
+        return read(node).replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n').trim();
     }
 
     function dispatchValueEvents(node) {
@@ -697,6 +758,31 @@
         return true;
     }
 
+    function optionSelected(option) {
+        return !!(option.matches('.check_answer,.check_answer_dx,[aria-checked=true]') ||
+            option.querySelector('.check_answer,.check_answer_dx,input:checked,[aria-checked=true]'));
+    }
+
+    function syncMultipleChoices(options, desired) {
+        const original = options.map(optionSelected);
+        const expected = options.map((_, index) => desired.includes(String.fromCharCode(65 + index)));
+        const matches = values => values.every((selected, index) => optionSelected(options[index]) === selected);
+        if (matches(expected)) return { matched: true, changed: 0 };
+        if (original.some(Boolean) && !allowOverwrite('已有选项')) return { matched: false, changed: 0, skipped: true };
+        let changed = 0;
+        try {
+            options.forEach((option, index) => {
+                if (optionSelected(option) !== expected[index]) { option.click(); changed++; }
+            });
+            if (matches(expected)) return { matched: true, changed };
+        } catch (_) { /* Readback, not click success, decides the outcome. */ }
+        // Best effort restoration if the host ignores clicks or rejects updates.
+        options.forEach((option, index) => {
+            try { if (optionSelected(option) !== original[index]) option.click(); } catch (_) {}
+        });
+        return { matched: false, changed: 0 };
+    }
+
     function fillBlankTarget(target, value) {
         if (!target || !String(value).trim()) return false;
         const expected = String(value).replace(/\r\n?/g, '\n').trim();
@@ -706,18 +792,31 @@
             try {
                 const editor = window.UE.getEditor(name);
                 if (editor && typeof editor.setContent === 'function') {
-                    const oldHtml = typeof editor.getContent === 'function' ? editor.getContent() : '';
-                    const current = typeof editor.getContentTxt === 'function' ? editor.getContentTxt().replace(/\r\n?/g, '\n').trim() : editorText(oldHtml);
+                    const oldHtml = typeof editor.getContent === 'function' ? editor.getContent() : editor.body && editor.body.innerHTML;
+                    const read = () => typeof editor.getContent === 'function' ? editorText(editor.getContent()) : editor.body ? editorNodeText(editor.body) :
+                        typeof editor.getContentTxt === 'function' ? String(editor.getContentTxt()).replace(/\r\n?/g, '\n').trim() : null;
+                    const current = read();
+                    if (current == null || oldHtml == null) throw new Error('Editor cannot be safely read and restored');
                     if (current === expected) return 'present';
                     if (!allowOverwrite(current)) return 'skipped-existing';
-                    editor.setContent(editorHtml(value));
-                    if (typeof editor.fireEvent === 'function') editor.fireEvent('contentchange');
-                    if (typeof editor.sync === 'function') editor.sync();
-                    dispatchValueEvents(textarea); clickEditorSave(name);
-                    const written = typeof editor.getContentTxt === 'function' ? editor.getContentTxt().replace(/\r\n?/g, '\n').trim() : expected;
-                    if (written === expected) return current ? 'overwritten' : 'filled';
-                    editor.setContent(oldHtml || '');
-                    if (typeof editor.sync === 'function') editor.sync();
+                    const oldWhiteSpace = editor.body && editor.body.style.whiteSpace;
+                    let verified = false;
+                    try {
+                        editor.setContent(editorHtml(value));
+                        if (editor.body && expected.includes('\n')) editor.body.style.whiteSpace = 'pre-wrap';
+                        if (typeof editor.fireEvent === 'function') editor.fireEvent('contentchange');
+                        if (typeof editor.sync === 'function') editor.sync();
+                        dispatchValueEvents(textarea);
+                        if (read() === expected) {
+                            verified = true; clickEditorSave(name); return current ? 'overwritten' : 'filled';
+                        }
+                    } finally {
+                        if (!verified) {
+                            editor.setContent(oldHtml || '');
+                            if (editor.body) editor.body.style.whiteSpace = oldWhiteSpace || '';
+                            if (typeof editor.sync === 'function') editor.sync();
+                        }
+                    }
                     return false;
                 }
             } catch (_) { /* Try the DOM/editor iframe path below. */ }
@@ -727,20 +826,30 @@
             try {
                 const body = frame.contentDocument && frame.contentDocument.body;
                 if (!body) continue;
-                const current = (body.textContent || '').replace(/\r\n?/g, '\n').trim();
+                const current = editorNodeText(body);
                 if (current === expected) return 'present';
                 if (!allowOverwrite(current)) return 'skipped-existing';
-                const oldHtml = body.innerHTML;
-                body.innerHTML = editorHtml(value); dispatchValueEvents(body);
-                if ((body.textContent || '').replace(/\r\n?/g, '\n').trim() !== expected) { body.innerHTML = oldHtml; continue; }
-                if (textarea) setFormValue(textarea, editorHtml(value));
-                clickEditorSave(name);
-                return current ? 'overwritten' : 'filled';
+                const oldHtml = body.innerHTML, oldWhiteSpace = body.style.whiteSpace, oldValue = textarea && textarea.value;
+                let verified = false;
+                try {
+                    body.innerHTML = editorHtml(value); dispatchValueEvents(body);
+                    if (expected.includes('\n')) body.style.whiteSpace = 'pre-wrap';
+                    if (editorNodeText(body) !== expected) continue;
+                    if ((textarea && !setFormValue(textarea, editorHtml(value))) || editorNodeText(body) !== expected) continue;
+                    verified = true; clickEditorSave(name);
+                    return current ? 'overwritten' : 'filled';
+                } finally {
+                    if (!verified) {
+                        body.innerHTML = oldHtml; body.style.whiteSpace = oldWhiteSpace;
+                        if (textarea) setFormValue(textarea, oldValue);
+                    }
+                }
             } catch (_) { /* Try a native form control below. */ }
         }
         const input = target.matches && target.matches('textarea,input') ? target : target.querySelector &&
             target.querySelector('textarea,input[type=text],input:not([type])');
         if (input) {
+            if (input.hidden || input.type === 'hidden' || !input.getClientRects().length) return false;
             const current = String(input.value || '').replace(/\r\n?/g, '\n').trim();
             if (current === expected) return 'present';
             if (!allowOverwrite(current)) return 'skipped-existing';
@@ -750,11 +859,11 @@
         }
         const editable = target.isContentEditable ? target : target.querySelector && target.querySelector('[contenteditable=true]');
         if (editable) {
-            const current = (editable.textContent || '').replace(/\r\n?/g, '\n').trim();
+            const current = editorNodeText(editable);
             if (current === expected) return 'present';
             if (!allowOverwrite(current)) return 'skipped-existing';
             const oldHtml = editable.innerHTML; editable.textContent = value; dispatchValueEvents(editable);
-            if ((editable.textContent || '').replace(/\r\n?/g, '\n').trim() === expected) return current ? 'overwritten' : 'filled';
+            if (editorNodeText(editable) === expected) return current ? 'overwritten' : 'filled';
             editable.innerHTML = oldHtml;
         }
         return false;
@@ -797,6 +906,12 @@
                     Array.from(canonical).some(letter => letter.charCodeAt(0) - 65 >= optionDivs.length)) return;
                 const answerLetters = Array.from(new Set(canonical.split('')));
 
+                if (questionType === '多选题') {
+                    const result = syncMultipleChoices(Array.from(optionDivs), answerLetters);
+                    matched = result.matched; filledCount += result.changed;
+                    answerData.skippedExisting = result.skipped === true;
+                    progressAnswer = canonical + (result.skipped ? '（已有选项，按覆盖策略保留）' : !matched ? '（选项回读不一致，未确认写入）' : '');
+                } else {
                 answerLetters.forEach(letter => {
                     const optionIndex = letter.charCodeAt(0) - 65; // A=0, B=1, C=2, D=3
 
@@ -820,30 +935,28 @@
                 });
                 matched = optionDivs.length > 0;
                 progressAnswer = canonical;
+                }
             } else if (questionType === '判断题') {
-                const optionDivs = question.querySelectorAll('div.answerBg');
-                const judgeAnswer = String(aiAnswers[0] || '').trim();
-                if (!/^(对|错|正确|错误|true|false|√|×)$/i.test(judgeAnswer)) return;
-                const isCorrect = /^(对|正确|true|√)$/i.test(judgeAnswer);
-                const targetIndex = isCorrect ? 0 : 1; // 对=0, 错=1
-
-                if (targetIndex < optionDivs.length) {
+                const optionDivs = Array.from(question.querySelectorAll('div.answerBg'));
+                const judgeAnswer = window.__cefDeepSeek.judgeValue(aiAnswers[0]);
+                const values = optionDivs.map(option => window.__cefDeepSeek.judgeValue((option.querySelector('.answer_p,.clearfix') || option).textContent));
+                const targetIndex = values.indexOf(judgeAnswer);
+                if (judgeAnswer != null && values.length === 2 && values.includes(true) && values.includes(false) && targetIndex >= 0) {
                     const targetDiv = optionDivs[targetIndex];
-
-                    // 检查选项是否已经被选择（通过查找check_answer_dx或check_answer类）
-                    const isAlreadySelected = targetDiv.querySelector('.check_answer_dx') !== null ||
-                        targetDiv.querySelector('.check_answer') !== null;
-
-                    if (!isAlreadySelected) {
-                        // 直接点击整个answerBg div来选择判断选项
+                    const exact = () => optionDivs.every((option, index) => optionSelected(option) === (index === targetIndex));
+                    if (!exact() && optionDivs.some(optionSelected) && !allowOverwrite('已有判断选项')) {
+                        answerData.skippedExisting = true;
+                        progressAnswer = String(aiAnswers[0]) + '（已有选项，按覆盖策略保留）';
+                    } else if (!exact()) {
                         try {
                             targetDiv.click();
-                            filledCount++;
-                        } catch (error) {
-                            // 静默处理错误
-                        }
+                            if (exact()) filledCount++;
+                        } catch (_) { /* Read back before reporting success. */ }
                     }
-                    matched = true;
+                    matched = exact();
+                    if (!matched && !answerData.skippedExisting) progressAnswer += '（判断选项回读不一致，未确认写入）';
+                } else {
+                    progressAnswer += '（页面判断选项无法映射为对/错，未写入）';
                 }
             } else if (questionType === '填空题' || questionType === '简答题') {
                 const targets = answerData.targets && answerData.targets.length ? answerData.targets : collectBlankTargets(question);
@@ -852,18 +965,19 @@
                 } else {
                     const writes = targets.map((target, targetIndex) => fillBlankTarget(target, aiAnswers[targetIndex]));
                     matched = writes.every(result => result === 'filled' || result === 'overwritten' || result === 'present');
+                    answerData.skippedExisting = writes.includes('skipped-existing') && writes.every(Boolean);
                     filledCount += writes.filter(result => result === 'filled' || result === 'overwritten').length;
                     progressAnswer = aiAnswers.join('；') + (writes.includes('skipped-existing') ? '（已有内容，按覆盖策略未替换）' : writes.includes('overwritten') ? '（已替换原内容）' : '');
                 }
             }
             if (matched) {
                 matchedCount++;
-                reportProgress({ key: answerData.progressKey || questionHash, index: answerData.progressIndex || index + 1,
+                reportProgress({ key: answerData.progressKey || questionHash, root: question, index: answerData.progressIndex || index + 1,
                     question: answerData.questionText || '',
                     answer: `已填入：${progressAnswer}${answerData.needsReview ? '（模型建议核对）' : ''}`,
                     state: answerData.needsReview ? 'review' : 'success' });
             } else {
-                reportProgress({ key: answerData.progressKey || questionHash, index: answerData.progressIndex || index + 1,
+                reportProgress({ key: answerData.progressKey || questionHash, root: question, index: answerData.progressIndex || index + 1,
                     question: answerData.questionText || '', answer: `未填入：${progressAnswer}`, state: 'error' });
             }
         });
@@ -889,6 +1003,7 @@
         sourceCommit: '3b534edae5208f1b3bdb256142491a6cd28de4a0',
         active: () => window.__cefDeepSeek.enabled() && isChaoxingExamPage(),
         fetchAllAnswers, handleCopyAIRequest, fillAnswersFromAI,
+        retryFailed: () => fetchAllAnswers({ failedOnly: true }),
         isPaused: () => answeringPaused,
         setPaused: setAnsweringPaused,
         togglePause: () => setAnsweringPaused(!answeringPaused)

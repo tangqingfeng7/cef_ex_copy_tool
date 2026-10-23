@@ -8,6 +8,15 @@
   "concurrency": 1,
   "answerDelayMs": 1000,
   "overwritePolicy": "always",
+  "panelOpacity": 0.5,
+  "panelBounds": null,
+  "hotkeys": {
+    "panel": "Ctrl+G",
+    "selection": "Ctrl+D",
+    "pause": "Ctrl+R",
+    "capture": "Ctrl+Shift+S"
+  },
+  "answeringPaused": false,
   "maxImages": 6,
   "imageMaxEdge": 2048
 }

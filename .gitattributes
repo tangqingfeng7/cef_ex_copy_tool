@@ -1,0 +1,4 @@
+# Default to LF; keep Windows batch scripts in CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf

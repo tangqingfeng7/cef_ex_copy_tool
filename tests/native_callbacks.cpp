@@ -101,13 +101,13 @@ int main() {
         int shortcut = 0;
         CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 1);
         CHECK(shortcut == 1 && scripts == beforeShortcut + 1 && frameRefs == 1 && preKeyCalls == 0);
-        CHECK(injected.back().find(L"toggleSettings()") != std::wstring::npos);
+        CHECK(injected.back().find(L"handleHotkey('panel'") != std::wstring::npos);
         event.native_key_code = 1u << 30;
         CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 1);
         CHECK(scripts == beforeShortcut + 1); // Holding Ctrl+G never flickers.
-        event.native_key_code = 0; event.modifiers |= EVENTFLAG_SHIFT_DOWN;
+        event.native_key_code = 0; event.modifiers = EVENTFLAG_CONTROL_DOWN; event.windows_key_code = 'R';
         CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 1);
-        CHECK(scripts == beforeShortcut + 2 && injected.back().find(L"togglePause()") != std::wstring::npos);
+        CHECK(scripts == beforeShortcut + 2 && injected.back().find(L"handleHotkey('pause'") != std::wstring::npos);
         event.modifiers = EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN;
         CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 7);
         event.modifiers = EVENTFLAG_CONTROL_DOWN;
@@ -115,8 +115,52 @@ int main() {
         detached = true;
         CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 7);
         CHECK(frameRefs == 1 && preKeyCalls == 3);
-        detached = false; captureScripts = false; injected.clear(); shortcutFrame = nullptr;
-        std::cout << "PASS: native Ctrl+G panel and Ctrl+Shift+G pause target main frame, consume once before DOM, ignore repeat and preserve original callbacks/refcounts\n";
+        detached = false;
+        event.windows_key_code = VK_DOWN; event.modifiers = 0; event.native_key_code = 0;
+        const int beforeArrow = scripts;
+        CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 7);
+        CHECK(scripts == beforeArrow + 1 && frameRefs == 1);
+        CHECK(injected.back().find(L"__cefLegacyPanel.setVisible(true)") != std::wstring::npos);
+        event.windows_key_code = VK_UP;
+        CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 7);
+        CHECK(injected.back().find(L"__cefLegacyPanel.setVisible(false)") != std::wstring::npos);
+        event.modifiers = EVENTFLAG_SHIFT_DOWN;
+        CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 7);
+        CHECK(scripts == beforeArrow + 2);
+        event.modifiers = 0; event.native_key_code = 1u << 30;
+        CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 7);
+        CHECK(scripts == beforeArrow + 2);
+        event.native_key_code = 0; event.modifiers = EVENTFLAG_CONTROL_DOWN;
+        event.windows_key_code = 'D'; shortcutBrowser.get_focused_frame = shortcutMain;
+        CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 1);
+        CHECK(injected.back().find(L"cef-cx-selection-draft") != std::wstring::npos && injected.back().find(L"password") != std::wstring::npos);
+        event.windows_key_code = 'S'; event.modifiers |= EVENTFLAG_SHIFT_DOWN;
+        CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 1);
+        CHECK(injected.back().find(L"handleHotkey('capture'") != std::wstring::npos);
+        const int afterCapture = scripts; event.native_key_code = 1u << 30;
+        CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 1 && scripts == afterCapture);
+        CHECK(frameRefs == 1);
+        std::cout << "PASS: native Ctrl+D selection auto-send (focused frame, password excluded), Ctrl+Shift+S capture, auto-repeat/refcounts\n";
+        CHECK(IsAllowedAiProxyRouteForTest(L"https://mooc1.chaoxing.com/__cef_cx_ai_proxy__/hotkeys", L"https://mooc1.chaoxing.com", L"POST"));
+        CHECK(!IsAllowedAiProxyRouteForTest(L"https://mooc1.chaoxing.com/__cef_cx_ai_proxy__/hotkeys", L"https://mooc1.chaoxing.com", L"GET"));
+        CHECK(!IsAllowedAiProxyRouteForTest(L"https://mooc1.chaoxing.com/__cef_cx_ai_proxy__/hotkeys", L"https://foreign.example", L"POST"));
+        AiHotkeys::Bindings hotkeys{}; AiHotkeys::Binding parsed{};
+        CHECK(AiHotkeys::Parse("Ctrl+D", parsed) && parsed.key == 'D' && parsed.modifiers == AiHotkeys::Control);
+        CHECK(!AiHotkeys::Parse("Ctrl+C", parsed) && !AiHotkeys::Parse("Alt+F4", parsed) && !AiHotkeys::Parse("D", parsed));
+        CHECK(!AiHotkeys::ParseWire("panel=Ctrl+G\nselection=Ctrl+G\npause=Ctrl+R\ncapture=Ctrl+Shift+S", hotkeys));
+        CHECK(AiHotkeys::Update(73, "panel=Alt+P\nselection=Ctrl+Alt+D\npause=Ctrl+F8\ncapture=Ctrl+Shift+S"));
+        CHECK(AiHotkeys::Get(74)[AiHotkeys::Selection].combo == "Ctrl+D"); // Browser isolation.
+        shortcutBrowser.get_identifier = [](cef_browser_t*) { return 73; };
+        event.native_key_code = 0; event.windows_key_code = 'R'; event.modifiers = EVENTFLAG_CONTROL_DOWN;
+        CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 7); // Old default released.
+        event.windows_key_code = VK_F8;
+        CHECK(keys.on_pre_key_event(&keys, &shortcutBrowser, &event, nullptr, &shortcut) == 1);
+        CHECK(injected.back().find(L"handleHotkey('pause','Ctrl+F8')") != std::wstring::npos);
+        CHECK(!AiHotkeys::Update(73, "panel=Ctrl+G") && AiHotkeys::Get(73)[AiHotkeys::Pause].combo == "Ctrl+F8");
+        CHECK(frameRefs == 1);
+        std::cout << "PASS: native custom bindings, reserved/duplicate rejection, browser isolation, old binding release and live dispatch\n";
+        captureScripts = false; injected.clear(); shortcutFrame = nullptr;
+        std::cout << "PASS: native Ctrl+G panel and Ctrl+R pause target main frame, consume once before DOM, ignore repeat and preserve original callbacks/refcounts\n";
         keys.base.release(&keys.base);
         loadA.base.release(&loadA.base); loadB.base.release(&loadB.base);
         clientA.base.release(&clientA.base); clientB.base.release(&clientB.base);
@@ -203,6 +247,45 @@ int main() {
         CHECK(IsAllowedDeepSeekTargetForTest(L"https://api.deepseek.com/v1/chat/completions"));
         CHECK(!IsAllowedDeepSeekTargetForTest(L"https://127.0.0.1/chat/completions"));
         CHECK(!IsAllowedDeepSeekTargetForTest(L"https://api.deepseek.com.evil.example/chat/completions"));
+        CHECK(IsAllowedAiProxyRouteForTest(
+            L"https://mooc1.chaoxing.com/__cef_cx_ai_proxy__/user/balance",
+            L"https://mooc1.chaoxing.com", L"GET"));
+        CHECK(!IsAllowedAiProxyRouteForTest(
+            L"https://mooc1.chaoxing.com/__cef_cx_ai_proxy__/user/balance",
+            L"https://mooc1.chaoxing.com", L"POST"));
+        CHECK(!IsAllowedAiProxyRouteForTest(
+            L"https://evil.example/__cef_cx_ai_proxy__/user/balance",
+            L"https://evil.example", L"GET"));
+        CHECK(!IsAllowedAiProxyRouteForTest(
+            L"https://mooc1.chaoxing.com:444/__cef_cx_ai_proxy__/user/balance",
+            L"https://mooc1.chaoxing.com", L"GET"));
+        CHECK(IsAllowedDeepSeekBalanceTargetForTest(L"https://api.deepseek.com/user/balance"));
+        const std::wstring localConfig = L"https://mooc1.chaoxing.com/__cef_cx_ai_proxy__/config";
+        const std::wstring examFrame = L"https://mooc1.chaoxing.com/exam-ans/exam/test/fixture";
+        CHECK(IsAllowedAiProxySourceForTest(localConfig, L"", examFrame, L"POST", false, false));
+        CHECK(!IsAllowedAiProxySourceForTest(localConfig, L"", L"", L"POST", false, false));
+        CHECK(!IsAllowedAiProxySourceForTest(localConfig, L"null", examFrame, L"POST", false, false));
+        CHECK(!IsAllowedAiProxySourceForTest(localConfig, L"https://evil.example", examFrame, L"POST", false, false));
+        CHECK(!IsAllowedAiProxySourceForTest(localConfig, L"", L"https://other.chaoxing.com/", L"POST", false, false));
+        CHECK(!IsAllowedAiProxySourceForTest(localConfig, L"", examFrame, L"POST", true, false));
+        CHECK(!IsAllowedAiProxySourceForTest(localConfig, L"", examFrame, L"POST", false, true));
+        CHECK(!IsAllowedDeepSeekTargetForTest(L"https://api.deepseek.com/user/balance"));
+        for (const auto* invalid : {L"https://api.deepseek.com/chat/completions", L"https://api.deepseek.com:444/user/balance",
+             L"http://api.deepseek.com/user/balance", L"https://api.deepseek.com/user/balance?x=1",
+             L"https://api.deepseek.com/user/balance#fragment", L"https://api.deepseek.com.evil.example/user/balance",
+             L"https://key@api.deepseek.com/user/balance"}) CHECK(!IsAllowedDeepSeekBalanceTargetForTest(invalid));
+        CHECK(IsAllowedAiProxyRouteForTest(L"https://mooc1.chaoxing.com/__cef_cx_ai_proxy__/capture", L"https://mooc1.chaoxing.com", L"POST"));
+        CHECK(!IsAllowedAiProxyRouteForTest(L"https://mooc1.chaoxing.com/__cef_cx_ai_proxy__/capture", L"https://mooc1.chaoxing.com", L"GET"));
+        CHECK(!IsAllowedAiProxyRouteForTest(L"https://mooc1.chaoxing.com/__cef_cx_ai_proxy__/capture", L"https://evil.example", L"POST"));
+        std::vector<unsigned char> screenshot;
+        CHECK(!CaptureBrowserClientForTest(nullptr, screenshot));
+        HWND captureFixture = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"STATIC", L"capture fixture", WS_POPUP | WS_VISIBLE,
+            -30000, -30000, 160, 90, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        CHECK(captureFixture != nullptr); UpdateWindow(captureFixture);
+        const bool captureOk = CaptureBrowserClientForTest(captureFixture, screenshot); DestroyWindow(captureFixture);
+        CHECK(captureOk && screenshot.size() == 54 + 160 * 90 * 4);
+        CHECK(screenshot[0] == 'B' && screenshot[1] == 'M');
+        std::cout << "PASS: browser-client-only BMP capture, null window rejection, capture POST/source guards\n";
         auto* nativeRequestHandler = CreateNativeAiRequestHandler();
         CHECK(nativeRequestHandler && nativeRequestHandler->get_resource_request_handler);
         CHECK(nativeRequestHandler->base.release(&nativeRequestHandler->base) == 1);

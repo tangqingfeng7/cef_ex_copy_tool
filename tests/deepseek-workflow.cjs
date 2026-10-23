@@ -49,12 +49,12 @@ test('Save persists config through the DLL route; chat keeps context and accepts
         await host.locator('#overwritePolicy').selectOption('ask');
         await host.locator('#enabled').check();
         await host.locator('#save').click();
-        for (let i = 0; i < 50 && saved.length === 0; i++) await page.waitForTimeout(20);
-        assert.equal(saved.length, 1);
-        assert.equal(saved[0].apiKey, 'fixture-persistent-key');
-        assert.equal(saved[0].enabled, true);
-        assert.equal(saved[0].answerDelayMs, 1500);
-        assert.equal(saved[0].overwritePolicy, 'ask');
+        for (let i = 0; i < 50 && !saved.some(c => c.apiKey === 'fixture-persistent-key'); i++) await page.waitForTimeout(20);
+        assert(saved.length >= 1);
+        assert.equal(saved.at(-1).apiKey, 'fixture-persistent-key');
+        assert.equal(saved.at(-1).enabled, true);
+        assert.equal(saved.at(-1).answerDelayMs, 1500);
+        assert.equal(saved.at(-1).overwritePolicy, 'ask');
         assert.equal(await host.locator('#answerDelay').isVisible(), true, 'delay setting stays in the main DeepSeek answer pane');
         assert.match(await host.locator('.answer-controls').textContent(), /逐题间隔.*答题控制/);
         const controlHeights = await host.locator('.answer-controls').evaluate(node => [
@@ -88,10 +88,11 @@ test('Save persists config through the DLL route; chat keeps context and accepts
         assert(chats[1].messages.some(message => message.role === 'user' && typeof message.content === 'string' && message.content.includes('继续说明')));
         await host.locator('#tabAnswer').click();
         await host.locator('#advanced').evaluate(element => element.open = true);
+        const beforeClear = saved.length;
         await host.locator('#clear').click();
-        for (let i = 0; i < 50 && saved.length < 2; i++) await page.waitForTimeout(20);
-        assert.equal(saved[1].apiKey, '');
-        assert.equal(saved[1].enabled, false);
+        for (let i = 0; i < 50 && (saved.length <= beforeClear || saved.at(-1).apiKey !== ''); i++) await page.waitForTimeout(20);
+        assert.equal(saved.at(-1).apiKey, '');
+        assert.equal(saved.at(-1).enabled, false);
     } finally { await browser.close(); }
 });
 
@@ -132,7 +133,7 @@ test('automatic answering requests and fills strictly one question at a time', {
     } finally { await browser.close(); }
 });
 
-test('existing rich-editor text is backed up, cleared and replaced; pause button and Ctrl+Shift+G resume safely', { timeout: 30000 }, async () => {
+test('existing rich-editor text is backed up, cleared and replaced; pause button and Ctrl+R resume safely', { timeout: 30000 }, async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     try {
         const page = await browser.newPage(); let requests = 0, requestedAt = 0;
@@ -164,7 +165,7 @@ test('existing rich-editor text is backed up, cleared and replaced; pause button
         assert.equal(requests, 0, 'pause prevents paid requests before resume');
         const host = page.locator('#cef-deepseek-settings');
         assert.match(await host.locator('#pause').textContent(), /继续答题/);
-        await page.keyboard.press('Control+Shift+G');
+        await page.keyboard.press('Control+r');
         await page.waitForFunction(() => document.querySelector('#editor').contentDocument.body.textContent.trim() === '12');
         assert.equal(requests, 1);
         assert(Date.now() - requestedAt < 500, 'the final answer is filled immediately because no next-question interval is needed');
