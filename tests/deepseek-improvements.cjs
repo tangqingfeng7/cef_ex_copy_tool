@@ -123,3 +123,15 @@ test('question image diagnostics include safe local previews and distinguish cap
         assert.equal(apiCalls, 1, 'unreadable image must not start a text-only paid fallback');
     } finally { await f.browser.close(); }
 });
+
+test('tag release automation publishes only the DLL and checks live tag identity', () => {
+    const workflow = fs.readFileSync(path.join(sourceRoot, '.github/workflows/build.yml'), 'utf8');
+    assert.match(workflow, /Publish verified DLL/);
+    assert.match(workflow, /contents: write/);
+    const script = fs.readFileSync(path.join(sourceRoot, 'tools/publish-release.ps1'), 'utf8');
+    assert.match(script, /ls-remote/);
+    assert.match(script, /--clobber/);
+    assert.match(script, /Get-FileHash/);
+    assert.match(script, /gh release download/);
+    assert.match(script, /v\$Version/);
+});

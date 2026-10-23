@@ -120,6 +120,24 @@ jobs:
           compression-level: 0
           retention-days: 30
 
+      - name: Prepare verified DLL for publishing
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out/publish | Out-Null
+          Copy-Item -LiteralPath out/build/x86-integrated/src/Release/winmm.dll -Destination out/publish/winmm.dll
+          (Get-FileHash -LiteralPath out/publish/winmm.dll -Algorithm SHA256).Hash.ToLowerInvariant() |
+            Set-Content -LiteralPath out/publish/winmm.dll.sha256 -Encoding ascii
+
+      - name: Upload verified DLL
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-dll-${{ github.sha }}
+          path: out/publish/*
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v7
@@ -130,3 +148,31 @@ jobs:
             out/release/.partial-*/**
           if-no-files-found: warn
           retention-days: 7
+
+  publish:
+    name: Publish verified DLL
+    needs: build-test-package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_COMMIT: ${{ github.sha }}
+      RELEASE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download tested DLL from this run
+        shell: pwsh
+        run: |
+          gh run download $env:GITHUB_RUN_ID -R $env:RELEASE_REPOSITORY -n "release-dll-$env:RELEASE_COMMIT" -D out/publish
+          if ($LASTEXITCODE) { throw 'Cannot download tested DLL.' }
+      - name: Publish verified DLL
+        shell: pwsh
+        run: ./tools/publish-release.ps1 -Tag $env:RELEASE_TAG -Commit $env:RELEASE_COMMIT -Repository $env:RELEASE_REPOSITORY

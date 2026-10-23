@@ -7,6 +7,8 @@ const { readResource } = require('../embedded-resources.cjs');
 const { decodeResource } = require('../resource-codec.cjs');
 const ROOT = path.resolve(__dirname, '../..');
 const FILES = ['winmm.dll'];
+// Keep the packaged attribution even when the standalone source notice is removed.
+const UPSTREAM_AI_NOTICE = "# Upstream AI source attribution\n\n`deepseek_ai_script.js` was copied and adapted from:\n\n- Project: SJYssr/CxExam_automatic_answering\n- URL: https://github.com/SJYssr/CxExam_automatic_answering\n- Commit: `3b534edae5208f1b3bdb256142491a6cd28de4a0`\n- Original file: `src/scripts/deepseek_ai_script.js`\n- License: GPL-3.0 (the root LICENSE is retained in source and release packages).\n\nRetained workflow: exam-page detection, page-load collection, Ctrl+C/copy-to-AI,\nclick-to-fill, middle-click batch fill, question types and DOM selectors.\n\nLocal adaptations: persistent DLL-adjacent config and Ctrl+G popup/opacity, bounded\nmultimodal vision requests using deepseek-flash, images from question/option DOM,\nstrict request-delay-fill-next sequential answering, pause/resume controls,\nbackup-clear-write-verify rich-editor replacement, contextual chat with clipboard-image\npaste, safe text insertion, stale-result checks, removal of destructive answer cleanup\nand private console logging. Missing/ambiguous multi-blank mapping is left for\nmanual review instead of copying one answer to every blank. The existing legacy\nworker yields to this AI flow on supported exam pages to avoid duplicate requests.\n";
 const sha256 = data => crypto.createHash('sha256').update(data).digest('hex');
 function runPowerShell(script, args) {
     return JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive',
@@ -93,7 +95,7 @@ function makeRelease() {
     const readme = Buffer.from(runtimeReadme(dllBuild), 'utf8');
     const license = fs.readFileSync(path.join(ROOT, 'LICENSE'));
     for (const [name, bytes] of [['README.txt', readme], ['LICENSE', license], ['config.example.json', example],
-        ['UPSTREAM_AI_NOTICE.md', fs.readFileSync(path.join(ROOT, 'scripts/UPSTREAM_AI_NOTICE.md'))]]) {
+        ['UPSTREAM_AI_NOTICE.md', Buffer.from(UPSTREAM_AI_NOTICE, 'utf8')]]) {
         fs.writeFileSync(path.join(stage, name), bytes);
         manifest.files[name] = sha256(bytes);
     }

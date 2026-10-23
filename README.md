@@ -112,6 +112,12 @@ out/js/metadata.json
 
 ## 测试与打包
 
+### GitHub Release 自动发布
+
+推送 `v*` tag 后，Actions 完整测试成功才进入独立发布任务。发布前验证 tag 与 `VERSION` 一致、远端 tag 仍指向触发提交，说明来自 `releases/<tag>.md`。仅上传 `winmm.dll`，源码 ZIP/TAR 由 GitHub 自动提供；调试符号仍留在 Actions artifacts，不放进 Release。上传后重新下载 DLL 核对 SHA-256。发现 tag 移动、缺少说明、哈希不一致或已有意外资产时停止，不自动删除用户资产。
+
+普通分支 push/PR 只构建测试，不自动发布。修改旧版本 tag 属于历史改写，必须由维护者单独明确执行；工作流不会移动 tag。
+
 推荐在发布前执行统一验证：
 
 ```powershell
@@ -151,7 +157,7 @@ npm run package --prefix tools/transpile
 
 `.github/workflows/build.yml` 在每次 push、Pull Request、版本标签和手动触发时运行。Windows Runner 会按照 `vcpkg-configuration.json` 的 baseline 安装 x86 Detours，使用锁文件执行 `npm ci`，然后运行与本地相同的 `tools/test.ps1` 完整验证。
 
-验证通过后，Actions 分别上传运行 ZIP 和与其匹配的符号 ZIP，并附带 `archives.json`。版本标签必须与 `VERSION` 完全一致，例如 `VERSION` 为 `1.0.0` 时只能使用 `v1.0.0`；不匹配会在编译前停止。自动构建只生成 GitHub Actions 工件，不创建 GitHub Release，也不会部署到客户端。工件默认保留 30 天，失败日志保留 7 天。
+验证通过后，Actions 分别上传运行 ZIP 和与其匹配的符号 ZIP，并附带 `archives.json`。版本标签必须与 `VERSION` 完全一致，例如 `VERSION` 为 `1.0.0` 时只能使用 `v1.0.0`；不匹配会在编译前停止。普通分支 push/PR 只生成 GitHub Actions 工件；版本标签在完整验证通过后还会进入独立发布任务，创建或更新 GitHub Release，并仅上传已验证的 `winmm.dll`。所有流程均不会部署到客户端。工件默认保留 30 天，失败日志保留 7 天。
 
 vcpkg 二进制缓存与 npm 缓存会在后续运行复用。Dependabot 每周检查 GitHub Actions 主版本更新。
 

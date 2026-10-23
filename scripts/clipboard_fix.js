@@ -32,13 +32,19 @@
                     (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.keyCode === 45);
             }
             var controls = 'label,button,select,option,a[href],[role="button"],[role="checkbox"],input[type="checkbox"],input[type="radio"],input[type="button"],input[type="submit"],input[type="reset"]';
+            var optionContainers = ['.questionLi .answerBg', '.TiMu .answerBg'];
+            function selectableOption(e) {
+                var el = e.target && (e.target.nodeType === 3 ? e.target.parentElement : e.target);
+                if (!el || !el.closest || el.closest('input,textarea,button,select,option,a[href],[contenteditable="true"]')) return null;
+                return el.closest(optionContainers.join(','));
+            }
             function controlTarget(e) {
                 var el = e.target;
                 return el && el.closest ? el.closest(controls) : null;
             }
             function protectedEvent(e) {
                 // Labels/buttons should keep their normal selection behavior.
-                if (e.type === 'selectstart' && controlTarget(e) && !editable(e)) return false;
+                if (e.type === 'selectstart' && controlTarget(e) && !editable(e) && !selectableOption(e)) return false;
                 return /^(copy|selectstart|contextmenu|beforecopy)$/.test(e.type) ||
                     (editable(e) && (/^(paste|cut|beforepaste|beforecut)$/.test(e.type) ||
                     (/^key(down|press|up)$/.test(e.type) && shortcut(e))));
@@ -46,7 +52,9 @@
             // Applies to earlier listeners without wrapping addEventListener,
             // so removeEventListener and listener identity retain native behavior.
             proto.preventDefault = function () {
-                if (!protectedEvent(this)) return prevent.call(this);
+                // Option text is selectable even when its clickable row cancels mousedown.
+                // Keep propagation intact: normal option clicks must still reach the host.
+                if (!protectedEvent(this) && !(this.type === 'mousedown' && this.button === 0 && selectableOption(this))) return prevent.call(this);
             };
             proto.stopPropagation = function () {
                 if (!protectedEvent(this)) return stop.call(this);
@@ -93,6 +101,24 @@
                 }
             });
             var mouseMode = false;
+            var optionDrag = null, suppressOptionClick = null;
+            listen(w, 'mousedown', function (e) {
+                suppressOptionClick = null; optionDrag = null;
+                var root = e.button === 0 && selectableOption(e);
+                if (root) optionDrag = { root: root, x: e.clientX, y: e.clientY };
+            });
+            listen(w, 'mouseup', function (e) {
+                var drag = optionDrag; optionDrag = null;
+                if (!drag || e.button !== 0 || Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) < 5) return;
+                var selection = w.getSelection();
+                if (selection && !selection.isCollapsed && selection.toString()) suppressOptionClick = { root: drag.root, at: Date.now() };
+            });
+            listen(w, 'click', function (e) {
+                var gesture = suppressOptionClick;
+                if (!gesture || !e.isTrusted || e.detail === 0 || Date.now() - gesture.at > 500 || selectableOption(e) !== gesture.root) return;
+                suppressOptionClick = null;
+                prevent.call(e); stopImmediate.call(e);
+            });
             function updateFocusMode() {
                 if (!d.documentElement) return;
                 if (mouseMode) d.documentElement.setAttribute('data-cef-pointer-mode', '');
@@ -113,6 +139,10 @@
                 style.id = '__cefClipboardStyle';
                 style.textContent = '*{user-select:text!important;-webkit-user-select:text!important;}' +
                     controls.split(',').map(function (selector) { return selector + ',' + selector + ' *'; }).join(',') +
+                    '{user-select:none!important;-webkit-user-select:none!important;}' +
+                    optionContainers.map(function (selector) { return selector + ',' + selector + ' *'; }).join(',') +
+                    '{user-select:text!important;-webkit-user-select:text!important;}' +
+                    optionContainers.map(function (selector) { return selector + ' input,' + selector + ' button,' + selector + ' button *,' + selector + ' a[href],' + selector + ' a[href] *'; }).join(',') +
                     '{user-select:none!important;-webkit-user-select:none!important;}' +
                     'textarea,input:not([type]),input[type="text"],input[type="search"],input[type="url"],input[type="email"],input[type="tel"],input[type="password"],[contenteditable="true"],[contenteditable="true"] *' +
                     '{user-select:text!important;-webkit-user-select:text!important;}' +
