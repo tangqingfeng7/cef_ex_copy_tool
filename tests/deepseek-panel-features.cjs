@@ -53,6 +53,14 @@ async function fixture() {
 
 test('panel geometry persists without saving a draft Key and restores across reload and viewport changes', { timeout: 30000 }, async () => {
     const f = await fixture();
+    async function resizeViewport(size) {
+        // setViewportSize can resolve before the page's resize handlers have restored the panel.
+        await f.page.evaluate(() => {
+            window.__testViewportResize = new Promise(resolve => window.addEventListener('resize', () => resolve(), { once: true }));
+        });
+        await f.page.setViewportSize(size);
+        await f.page.evaluate(() => window.__testViewportResize);
+    }
     try {
         await f.panel.locator('#key').fill('unsaved-key-must-not-persist');
         let box = await f.panel.locator('#titlebar').boundingBox();
@@ -66,9 +74,9 @@ test('panel geometry persists without saving a draft Key and restores across rel
         await f.load(f.state.config);
         box = await f.panel.boundingBox();
         for (const [key, field] of [['x', 'left'], ['y', 'top'], ['width', 'width'], ['height', 'height']]) assert(Math.abs(box[key] - expected[field]) <= 1, key);
-        await f.page.setViewportSize({ width: 280, height: 300 });
+        await resizeViewport({ width: 280, height: 300 });
         box = await f.panel.boundingBox(); assert(box.x >= 0 && box.y >= 0 && box.x + box.width <= 281 && box.y + box.height <= 301);
-        await f.page.setViewportSize({ width: 1000, height: 900 }); box = await f.panel.boundingBox(); assert(Math.abs(box.width - expected.width) <= 1);
+        await resizeViewport({ width: 1000, height: 900 }); box = await f.panel.boundingBox(); assert(Math.abs(box.width - expected.width) <= 1);
         assert.deepEqual(f.errors, []);
     } finally { await f.close(); }
 });

@@ -9,8 +9,6 @@ function Resolve-CefBuildEnvironment {
     if (-not [string]::IsNullOrWhiteSpace($env:VSINSTALLDIR)) {
         $taskCandidates.Add($env:VSINSTALLDIR.TrimEnd('\'))
     }
-    $taskCandidates.Add('D:\Admin\VSBuildTools')
-
     $taskVswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (Test-Path -LiteralPath $taskVswhere) {
         $taskDetected = & $taskVswhere -latest -products * `

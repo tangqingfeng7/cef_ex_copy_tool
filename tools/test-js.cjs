@@ -7,7 +7,9 @@ function run(args) {
     const result = spawnSync(process.execPath, args, { cwd: root, stdio: 'inherit' });
     if (result.status !== 0) process.exit(result.status || 1);
 }
-run(['--test', ...fs.readdirSync(path.join(root, 'tests')).filter(n => n.endsWith('.cjs')).sort().map(n => path.join(root, 'tests', n))]);
+// Browser processes compete for limited CI resources; keep CI serial and local runs bounded.
+const browserConcurrency = process.env.CI ? 1 : 4;
+run(['--test', '--test-concurrency=' + browserConcurrency, ...fs.readdirSync(path.join(root, 'tests')).filter(n => n.endsWith('.cjs')).sort().map(n => path.join(root, 'tests', n))]);
 run([path.join(root, 'tools/test-clipboard.cjs'), path.join(root, 'out/build/x86-integrated/src/Release/winmm.dll')]);
 run(['--test', path.join(root, 'tests/build-incremental.test.js')]);
 run(['--test', path.join(root, 'tests/release.test.js')]);

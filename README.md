@@ -4,7 +4,6 @@
 
 基于 CEF Hook 的 Windows 客户端扩展，用于恢复页面文字选择、复制粘贴，并提供内置用户脚本加载能力。本项目基于 [SJYssr/CxExam_automatic_answering](https://github.com/SJYssr/CxExam_automatic_answering) 修改。
 
-当前构建目标为 **Windows 8 及以上 / x86（32 位）**，输出文件为 `winmm.dll`。仅支持与当前 Hook 接口兼容的 CEF 客户端，不保证适用于所有客户端版本。
 
 ## 功能
 
@@ -13,17 +12,9 @@
 - 鼠标操作时隐藏焦点 outline，避免题目或控件出现额外蓝框；按 `Tab` 导航时恢复焦点提示。保留正常输入框边框和文字选中高亮。
 - 保留只读、禁用字段状态，以及按钮、复选框等控件的正常交互。
 - 提供截图、窗口置顶和窗口切换相关的 Hook。
+- 内置用户脚本加载器，支持 `GM_xmlhttpRequest`、`GM_setValue`、`GM_getValue`、`GM_deleteValue`、`GM_listValues` 等 API。
+- 内置DeepSeekAI
 - 使用 `Ctrl+Shift+P` 打开开发者工具。
-
-## AI 对话面板
-
-- `Ctrl+G` 打开/隐藏面板；标题栏拖动、右下角拖拽调整尺寸。位置、尺寸和透明度通过既有配置保存通道持久化到 `config.json`，重启后恢复；窗口缩小时自动限制在可见区域。“重置面板”可恢复默认布局。自动保存不会带入尚未保存的 Key 草稿。
-- `Ctrl+D` 选中文字后立即发送到“对话”，无需再点发送；支持普通文字、文本输入框及获得焦点的子框架，不采集密码输入框。面板中的“带入选中文字”按钮仍只加入草稿；正在生成时不会重复发送。
-- `Ctrl+Shift+S` 或“框选截图”：只读取当前 CEF 浏览器窗口的客户区，冻结画面后拖动框选；`Esc` 取消。裁剪图片只加入草稿，不保存截图文件、不自动发送，也不读取整个桌面。部分 GPU/无窗口渲染客户端可能无法捕获，此时可用系统截图后 `Ctrl+V` 粘贴。
-- 对话只保留输入框上方的附件缩略图和“×”移除按钮，不再弹出二次预览确认区。点击“发送”或输入框 Enter 即发送当前文字、附件和有效历史上下文；Shift+Enter 换行，中文输入法组词中的 Enter 不发送。粘贴图片、框选截图和点击“带入选中文字”按钮本身仍不会自动发送；选中文字快捷键会立即发送。聊天记录使用 4px 浅灰圆角滚动条，隐藏上下箭头；底部透明度滑块保持原样。
-- 默认 `Ctrl+R` 暂停/继续答题。到“答题 → 更多设置 → 快捷键设置”点击对应输入框并按组合键，可自定义面板、选中文字发送、暂停/继续、截图四个快捷键；点击“保存快捷键”写入 `config.json` 并同步到原生 CEF 拦截器，重启后恢复。重复组合、复制粘贴等编辑键和 Alt+F4 会被拒绝；录入时不会触发原来的动作。
-- 对话默认使用 SSE 流式回复，逐段显示；兼容服务返回普通 JSON。支持“停止生成”，保留已收到的部分内容并标记未完成，不自动重发，也不将未完成回复加入后续上下文。停止客户端请求不保证服务端立即停止生成或计费。
-- 对话页显示排队、发送、等待、生成、完成/停止/失败状态与完成耗时；累计当前页面答题/对话接口实际报告的输入、输出及总 token。未报告用量的请求明确标记，不估算费用，不持久化聊天正文。
 
 ## 客户端需要哪些文件
 
@@ -43,15 +34,11 @@
 └── config.json      # 面板保存时生成；包含明文 API Key，请勿上传或分享
 ```
 
-CMake 会先检查内容缓存，必要时执行 Babel，生成配套的 `out/js/gm_shim.js` 和 `out/js/dat.js`，再编入 DLL。两者只是构建中间产物，无需部署；旧外置 JS 不会被此版本读取。
-
-`manifest.json` 是发布包的校验清单，记录 DLL 版本、源码指纹、Git 提交号、未提交修改标记、脚本构建标识、内嵌资源及 DLL 的 SHA-256。可用它核对发布文件的完整性，客户端运行不需要读取它。`winmm.pdb` 是调试符号，留在开发机并与对应 DLL 一起归档即可。
-
 ## 构建环境
 
 | 依赖 | 用途与要求 |
 | --- | --- |
-| Visual Studio 2022 Build Tools | 安装 C++ 编译工具、Windows SDK 和 CMake；构建脚本默认路径为 `D:\Admin\VSBuildTools` |
+| Visual Studio 2022 Build Tools | 安装 C++ 编译工具、Windows SDK 和 CMake；安装路径不限，构建脚本会自动查找，也可通过 `-BuildToolsPath` 指定 |
 | Detours | 使用 `x86-windows` 版本，必须包含头文件及 `lib/detours.lib` |
 | Node.js / npm | DLL 构建时生成版本与源码指纹，以及转译内嵌脚本、执行测试和打包；需可从终端调用 |
 | Microsoft Edge | 浏览器回归测试使用本机 Edge，无需另行下载 Playwright 浏览器 |
@@ -86,7 +73,7 @@ out/build/x86-integrated/src/Release/winmm.dll
 out/build/x86-integrated/src/Release/winmm.pdb
 ```
 
-构建脚本会依次检查显式参数、`VSINSTALLDIR`、`D:\Admin\VSBuildTools` 和 Visual Studio Installer。工具链安装在其他位置且无法自动发现时，传入实际路径：
+构建脚本会依次检查显式参数 `-BuildToolsPath`、环境变量 `VSINSTALLDIR` 和 Visual Studio Installer 提供的 `vswhere.exe` 检测结果，无需安装到固定目录。无法自动发现时，传入本机的实际安装路径（下面的路径仅为示例）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/build-dll.ps1 -BuildToolsPath 'D:\YourTools\VSBuildTools'
@@ -94,78 +81,8 @@ powershell -ExecutionPolicy Bypass -File tools/build-dll.ps1 -BuildToolsPath 'D:
 
 构建脚本只生成项目内的产物。项目不提供一键部署或自动复制到客户端的功能。
 
-### 单独检查脚本转译（不会更新 DLL）
 
-```powershell
-npm run build --prefix tools/transpile
-```
-
-构建器从 `scripts/dat.js` 提取用户脚本元数据，将代码转译后生成：
-
-```text
-out/js/dat.js
-out/js/gm_shim.js
-out/js/metadata.json
-```
-
-这些文件供资源编译器和打包校验读取，不需要放进客户端。正式构建 DLL 时会自动执行此转译步骤。
-
-## 测试与打包
-
-### GitHub Release 自动发布
-
-推送 `v*` tag 后，Actions 完整测试成功才进入独立发布任务。发布前验证 tag 与 `VERSION` 一致、远端 tag 仍指向触发提交，说明来自 `releases/<tag>.md`。仅上传 `winmm.dll`，源码 ZIP/TAR 由 GitHub 自动提供；调试符号仍留在 Actions artifacts，不放进 Release。上传后重新下载 DLL 核对 SHA-256。发现 tag 移动、缺少说明、哈希不一致或已有意外资产时停止，不自动删除用户资产。
-
-普通分支 push/PR 只构建测试，不自动发布。修改旧版本 tag 属于历史改写，必须由维护者单独明确执行；工作流不会移动 tag。
-
-推荐在发布前执行统一验证：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools/test.ps1
-npm run package --prefix tools/transpile
-```
-
-统一验证会重新编译 DLL、运行原生回调与隔离崩溃转储测试、构建 JavaScript，并检查源码指纹、诊断状态、脚本配对与初始化、jQuery 隔离、页面重建、控件交互和浏览器粘贴行为。浏览器测试还会从 DLL 中提取内置脚本，确认其与源码一致。测试使用本地页面与临时目录，不操作考试页面或客户端安装目录。
-
-测试脚本同样支持 `-BuildToolsPath` 参数。若 DLL 已经编译且只需检查 JavaScript，可运行 `npm test --prefix tools/transpile`；该命令不会重新编译 DLL。
-
-打包输出到 `out/release/<时间与随机后缀>/`：
-
-```text
-发布目录/
-├── winmm.dll
-├── config.example.json
-├── README.txt
-├── LICENSE
-├── manifest.json
-├── archives.json
-├── cef_ex_copy_tool-v<版本>-x86-<提交号>[-dirty].zip
-├── cef_ex_copy_tool-v<版本>-x86-<提交号>[-dirty]-symbols.zip
-└── symbols/
-    ├── winmm.pdb
-    ├── symbols.json
-    └── README.txt
-```
-
-**打包会重新构建 JavaScript，并生成运行 ZIP 与独立的调试符号 ZIP；使用现有 DLL，不会编译 DLL 或部署到客户端。** 修改 DLL 源码或内置脚本后，必须先重新编译或运行统一验证。
-
-运行 ZIP 包含运行文件 `winmm.dll`、可选配置模板 `config.example.json`、使用说明、许可证与校验清单；符号 ZIP 包含 `winmm.pdb`、符号清单和调试说明。打包会校验 PDB 的 GUID、age 与 DLL 是否匹配，缺少或不匹配时停止。`archives.json` 记录两个 ZIP 的 SHA-256；生成后还会解压读取各条目，核对文件哈希。全部检查成功才生成正式发布目录，失败中间产物保留在 `.partial-*` 目录。
-
-统一测试也包含实际打包与 ZIP 内容校验，因此测试通过后会留下一个可用发布目录。
-
-### GitHub Actions 自动构建
-
-`.github/workflows/build.yml` 在每次 push、Pull Request、版本标签和手动触发时运行。Windows Runner 会按照 `vcpkg-configuration.json` 的 baseline 安装 x86 Detours，使用锁文件执行 `npm ci`，然后运行与本地相同的 `tools/test.ps1` 完整验证。
-
-验证通过后，Actions 分别上传运行 ZIP 和与其匹配的符号 ZIP，并附带 `archives.json`。版本标签必须与 `VERSION` 完全一致，例如 `VERSION` 为 `1.0.0` 时只能使用 `v1.0.0`；不匹配会在编译前停止。普通分支 push/PR 只生成 GitHub Actions 工件；版本标签在完整验证通过后还会进入独立发布任务，创建或更新 GitHub Release，并仅上传已验证的 `winmm.dll`。所有流程均不会部署到客户端。工件默认保留 30 天，失败日志保留 7 天。
-
-vcpkg 二进制缓存与 npm 缓存会在后续运行复用。Dependabot 每周检查 GitHub Actions 主版本更新。
-
-打包前会读取 DLL 内嵌的构建记录，与当前源码指纹、`VERSION`、Git 提交号及 `x86/Release` 配置比较。不匹配、缺少构建记录时会报错并停止，不会生成发布目录。源码指纹覆盖 `src/`、`cef/`、`chromium/`、内置脚本和相关构建文件，包含尚未提交的源码内容，不依赖文件修改时间。
-
-更新 `dat.js` 或 `gm_shim.js` 也需要重新编译 DLL；提交产生新的 Git 提交号后，需要重新编译再打包。未提交修改允许打包，但会明确记录 `dirty: true`。源码压缩包没有 Git 信息时，提交号显示为 `null`，仍检查源码指纹。该检查用于识别版本混用，不是数字签名。
-
-## 手动安装与回滚
+## 手动安装
 
 1. 完全退出客户端。
 2. 手动备份客户端目录中原有的同名文件，并记录哪些文件原来不存在。
@@ -173,7 +90,6 @@ vcpkg 二进制缓存与 npm 缓存会在后续运行复用。Dependabot 每周�
 4. 无需复制 `gm_shim.js`、`dat.js`；本 DLL 不读取这些外置文件。
 5. 重新启动客户端。
 
-回退时先退出客户端，再手动恢复备份；本次新增、原来不存在的文件应移出客户端目录。构建、测试和打包均不会替你修改客户端文件。
 
 ## 修改后需要重新生成什么
 
