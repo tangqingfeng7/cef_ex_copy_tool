@@ -93,14 +93,14 @@ test('native-forwarded legacy controls work with a plain child frame but do not 
 test('config saves survive broken fetch; disabled AI and paused answering restore independently after reload', { timeout: 15000 }, async () => {
     const f = await fixture(false, true);
     try {
-        await panel(f.page).locator('#enabled').check(); await saved(f.page);
+        await panel(f.page).locator('#tabSettings').click(); await panel(f.page).locator('#enabled').check(); await panel(f.page).locator('#tabAnswer').click(); await saved(f.page);
         await panel(f.page).locator('#pause').click(); await saved(f.page);
-        await panel(f.page).locator('#enabled').uncheck(); await saved(f.page);
+        await panel(f.page).locator('#tabSettings').click(); await panel(f.page).locator('#enabled').uncheck(); await panel(f.page).locator('#tabAnswer').click(); await saved(f.page);
         assert.equal(f.disk().enabled, false); assert.equal(f.disk().answeringPaused, true);
         await f.load();
         assert.equal(await panel(f.page).locator('#enabled').isChecked(), false);
         assert.equal(await panel(f.page).locator('#pause').getAttribute('data-paused'), 'true');
-        await panel(f.page).locator('#enabled').check(); await saved(f.page);
+        await panel(f.page).locator('#tabSettings').click(); await panel(f.page).locator('#enabled').check(); await panel(f.page).locator('#tabAnswer').click(); await saved(f.page);
         assert.equal(await panel(f.page).locator('#pause').getAttribute('data-paused'), 'true', 'enabling AI must not implicitly resume');
         await f.load();
         assert.equal(await panel(f.page).locator('#enabled').isChecked(), true);
@@ -131,11 +131,11 @@ test('pause survives off/on during a waiting answer and resume starts the curren
             document.body.appendChild(q);
         });
         const started = f.page.waitForRequest('**/__cef_cx_ai_proxy__/chat/completions');
-        await panel(f.page).locator('#enabled').check(); await started;
+        await panel(f.page).locator('#tabSettings').click(); await panel(f.page).locator('#enabled').check(); await panel(f.page).locator('#tabAnswer').click(); await started;
         await panel(f.page).locator('#pause').click(); release();
-        await f.page.waitForFunction(() => document.querySelector('#cef-deepseek-settings').shadowRoot.querySelector('#progressBody').textContent.includes('已识别'), null, { timeout: 2000 });
-        await panel(f.page).locator('#enabled').uncheck(); await saved(f.page);
-        await panel(f.page).locator('#enabled').check(); await saved(f.page);
+        await f.page.waitForFunction(() => document.querySelector('#cef-deepseek-settings').shadowRoot.querySelector('#pause').getAttribute('data-paused') === 'true', null, { timeout: 2000 });
+        await panel(f.page).locator('#tabSettings').click(); await panel(f.page).locator('#enabled').uncheck(); await panel(f.page).locator('#tabAnswer').click(); await saved(f.page);
+        await panel(f.page).locator('#tabSettings').click(); await panel(f.page).locator('#enabled').check(); await panel(f.page).locator('#tabAnswer').click(); await saved(f.page);
         assert.equal(await panel(f.page).locator('#pause').getAttribute('data-paused'), 'true');
         await panel(f.page).locator('#pause').click();
         await f.page.waitForFunction(() => document.querySelector('.questionLi textarea').value === 'sample', null, { timeout: 2500 });

@@ -45,6 +45,7 @@
 
     // Persistent DLL configuration and vision-capable model are provided by deepseek.js.
     // The Key is stored in the DLL-adjacent config.json, never in page localStorage.
+    function answeringEnabled() { return window.__cefDeepSeek.answeringEnabled(); }
     function getAIConfig() {
         const status = window.__cefDeepSeek.status();
         return { apiKey: status.enabled && status.configured ? '[dll-configured]' : '', source: 'DLL目录 config.json' };
@@ -99,7 +100,7 @@
         let elapsed = 0;
         while (true) {
             await waitForAnsweringPermission();
-            if (!window.__cefDeepSeek.enabled() || epoch !== runEpoch) return false;
+            if (!answeringEnabled() || epoch !== runEpoch) return false;
             const remaining = Math.max(0, answerDelayMs() - elapsed);
             if (!remaining) break;
             const seconds = (remaining / 1000).toFixed(1).replace(/\.0$/, '');
@@ -108,7 +109,7 @@
             await sleep(step);
             elapsed += step;
         }
-        return window.__cefDeepSeek.enabled();
+        return answeringEnabled();
     }
 
     function reportStatus(message, state) {
@@ -131,7 +132,7 @@
     function observeQuestions() {
         if (autoObserver || !document.documentElement) return;
         autoObserver = new MutationObserver(() => {
-            if (!window.__cefDeepSeek.enabled() || !questionSignature()) return;
+            if (!answeringEnabled() || !questionSignature()) return;
             scheduleAutoAnswer(false, 120);
         });
         autoObserver.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true,
@@ -139,13 +140,13 @@
         if (!imageLoadListenerInstalled) {
             imageLoadListenerInstalled = true;
             document.addEventListener('load', event => {
-                if (event.target && event.target.tagName === 'IMG' && window.__cefDeepSeek.enabled()) scheduleAutoAnswer(false, 50);
+                if (event.target && event.target.tagName === 'IMG' && answeringEnabled()) scheduleAutoAnswer(false, 50);
             }, true);
         }
     }
 
     function scheduleAutoAnswer(force, delay = 0) {
-        if (!window.__cefDeepSeek.enabled() || !window.__cefDeepSeek.status().configured) return;
+        if (!answeringEnabled() || (!window.__cefDeepSeek.status().bankAnswerEnabled && !window.__cefDeepSeek.status().configured)) return;
         observeQuestions();
         if (autoTimer) clearTimeout(autoTimer);
         autoTimer = setTimeout(() => {
@@ -155,7 +156,7 @@
     }
 
     function requestAutoAnswer(force) {
-        if (!window.__cefDeepSeek.enabled()) return;
+        if (!answeringEnabled()) return;
         if (answeringPaused) { reportStatus('已暂停答题 · Ctrl+Shift+G 继续', 'success'); return; }
         const signature = questionSignature();
         if (!signature) {
@@ -247,10 +248,14 @@
     function buildQuestionModel(question, index) {
         const titleElement = question.querySelector('h3.mark_name,h3,.mark_name');
         if (!titleElement) return null;
-        const titleText = titleElement.textContent.trim();
+        const rawTitleText = titleElement.textContent.trim();
         const optionNodes = Array.from(question.querySelectorAll('div.answerBg'));
         const blankTargets = collectBlankTargets(question);
-        const type = detectQuestionType(question, titleText, blankTargets, optionNodes);
+        const type = detectQuestionType(question, rawTitleText, blankTargets, optionNodes);
+        const stemElement = titleElement.querySelector('.qtContent');
+        const stemClone = (stemElement || titleElement).cloneNode(true);
+        stemClone.querySelectorAll('.mark_letter,.answerBg,.mark_answer,.aiAssistant').forEach(node => node.remove());
+        const titleText = window.__cefDeepSeek.cleanQuestionStem(stemClone.textContent, type.code);
         const options = optionNodes.map(option => {
             const content = option.querySelector('div.clearfix,.answer_p') || option;
             return content.textContent.trim();
@@ -266,7 +271,7 @@
         const answers = result && result.list && Array.isArray(result.list[0]) ? result.list[0].map(cleanMarkdownFormat) : [];
         if (!answers.length) throw new Error('AI 未返回可用答案');
         return { answers, answer: model.type.code === 0 || model.type.code === 1 || model.type.code === 66 ? answers.join('') : answers.join('；'),
-            validate: model.data.__cefAIValidate, needsReview: result.needsReview === true };
+            validate: model.data.__cefAIValidate, source: result.source || 'DeepSeek', needsReview: result.needsReview === true };
     }
 
     /**
@@ -302,19 +307,20 @@
             window.aiAnswersData = null; window.copiedAIAnswer = null; window.copiedAIContext = null;
             lastRequestedSignature = '';
             setAnsweringPaused(window.__cefDeepSeek.status().answeringPaused === true, false);
-            if (window.__cefDeepSeek.enabled()) scheduleAutoAnswer(true);
+            if (answeringEnabled()) scheduleAutoAnswer(true);
         });
         ;
 
         // 监听鼠标中键 - 填充AI答案
-        document.addEventListener('mousedown', function(event) {
+        document.addEventListener('mousedown', async function(event) {
+            if (!answeringEnabled()) return;
             if (event.button === 1) { // 鼠标中键
                 event.preventDefault();
                 ;
 
                 if (window.aiAnswersData && Object.keys(window.aiAnswersData).length > 0) {
                     ;
-                    fillAnswersFromAI(window.aiAnswersData);
+                    await fillAnswersFromAI(window.aiAnswersData);
                     // 填充后清除数据
                     window.aiAnswersData = null;
                 } else {
@@ -426,7 +432,7 @@
 
         // 页面加载后自动获取答案
         ;
-        if (window.__cefDeepSeek.enabled()) scheduleAutoAnswer(true);
+        if (answeringEnabled()) scheduleAutoAnswer(true);
 
         // Ctrl+G / opacity / drag are supplied by the shared panel adapter.
 
@@ -534,7 +540,7 @@
      * 获取所有题目的AI答案
      */
     async function fetchAllAnswers(options = {}) {
-        if (!window.__cefDeepSeek.enabled()) return;
+        if (!answeringEnabled()) return;
         ;
 
         // 检查是否正在处理中
@@ -549,7 +555,7 @@
 
         // 检查API Key
         const config = getAIConfig();
-        if (!config.apiKey) {
+        if (!config.apiKey && !window.__cefDeepSeek.status().bankAnswerEnabled) {
             ;
             showAIToast('[AI答题] 未配置 API Key：按 Ctrl+G 打开设置面板填写，或在 winmm.dll 同目录的 config.json 中配置。', true);
             if (!settingsDialogShown) {
@@ -587,7 +593,7 @@
             // Strictly await and fill one question before the next request starts.
             for (let index = 0; index < questions.length; index++) {
                 await waitForAnsweringPermission();
-                if (!window.__cefDeepSeek.enabled() || epoch !== runEpoch) break;
+                if (!answeringEnabled() || epoch !== runEpoch) break;
                 const question = questions[index];
                 const originalIndex = allQuestions.indexOf(question);
                 const model = buildQuestionModel(question, originalIndex);
@@ -603,16 +609,16 @@
                     const answerData = {
                         answer: result.answer, answers: result.answers, root: question, validate: result.validate,
                         type: model.type.name, typeCode: model.type.code, targets: model.blankTargets,
-                        progressKey: model.key, progressIndex: originalIndex + 1, questionText, needsReview: result.needsReview
+                        progressKey: model.key, progressIndex: originalIndex + 1, questionText, source: result.source, needsReview: result.needsReview
                     };
                     answersData[model.key] = answerData;
                     window.aiAnswersData = answersData;
                     reportProgress({ key: model.key, root: question, index: originalIndex + 1, question: questionText,
-                        answer: `已识别：${result.answer}${result.needsReview ? '（建议核对）' : ''}`, state: 'pending' });
+                        answer: `${result.source}：${result.answer}${result.needsReview ? '（建议核对）' : ''}`, state: 'pending' });
                     await waitForAnsweringPermission();
-                    if (!window.__cefDeepSeek.enabled() || epoch !== runEpoch) break;
+                    if (!answeringEnabled() || epoch !== runEpoch) break;
                     if (result.validate && result.validate()) {
-                        const currentFill = fillAnswersFromAI({ [model.key]: answerData });
+                        const currentFill = await fillAnswersFromAI({ [model.key]: answerData });
                         filledCount += currentFill.filledCount;
                         matchedCount += currentFill.matchedCount;
                         if (currentFill.matchedCount || answerData.skippedExisting) failedQuestions.delete(question);
@@ -667,7 +673,7 @@
         } finally {
             // 重置处理状态
             isProcessing = false;
-            if (rerunRequested && window.__cefDeepSeek.enabled()) {
+            if (rerunRequested && answeringEnabled()) {
                 const force = rerunForced;
                 rerunRequested = false;
                 rerunForced = false;
@@ -740,10 +746,41 @@
         return String(node.value) === String(value);
     }
 
-    function clickEditorSave(name) {
-        if (!name) return;
-        const save = document.getElementById(name.replace('answerEditor', 'save_'));
-        if (save) save.click();
+    async function saveFilledQuestion(question, targets) {
+        const buttons = [];
+        function eligible(node) {
+            if (!node || !question.contains(node) || node.closest('.edui-toolbar,.edui-editor-toolbarbox')) return false;
+            const label = String(node.value || node.textContent || '').replace(/\s+/g, '');
+            return /^(保存|保存答案|保存答题|保存成功|已保存)$/.test(label) || /^save_/.test(node.id || '');
+        }
+        function add(node) { if (eligible(node) && !buttons.includes(node)) buttons.push(node); }
+        targets.forEach(target => {
+            const fields = target.matches('textarea,input') ? [target] : Array.from(target.querySelectorAll('textarea,input'));
+            fields.forEach(field => {
+                [field.id, field.getAttribute('name')].filter(Boolean).forEach(name => {
+                    if (name.includes('answerEditor')) add(document.getElementById(name.replace('answerEditor', 'save_')));
+                });
+            });
+        });
+        if (!buttons.length) question.querySelectorAll('button,a,input[type=button],input[type=submit],[id^=save_],[onclick]')
+            .forEach(node => { if (eligible(node) && !Array.from(node.children).some(eligible)) add(node); });
+        if (!buttons.length) return { clicked: false, reason: '内容已填入，但未找到本题保存按钮，请手动保存' };
+        // All blanks are written first, then each question-local save control is clicked once.
+        await sleep(120);
+        for (const button of buttons) {
+            if (!question.isConnected || !answeringEnabled()) return { clicked: false, reason: '保存前页面或设置发生变化，请核对本题' };
+            let waited = 0;
+            while ((button.disabled || button.getAttribute('aria-disabled') === 'true') && waited < 8000) { await sleep(200); waited += 200; }
+            if (button.disabled || button.getAttribute('aria-disabled') === 'true') return { clicked: false, reason: '本题保存按钮不可用，请手动核对保存状态' };
+            try { button.click(); } catch (_) { return { clicked: false, reason: '点击本题保存失败，请手动保存' }; }
+            await sleep(600);
+            waited = 0;
+            while (button.isConnected && (button.disabled || button.getAttribute('aria-disabled') === 'true' || /保存中/.test(button.textContent || '')) && waited < 8000) {
+                await sleep(200); waited += 200;
+            }
+            if (waited >= 8000) return { clicked: false, reason: '已点击保存，但保存状态等待超时，请核对后重试' };
+        }
+        return { clicked: true };
     }
 
     function allowOverwrite(current) {
@@ -752,7 +789,7 @@
         const policy = status && status.overwritePolicy || 'always';
         if (policy === 'empty-only') return false;
         if (policy === 'ask') {
-            try { return window.confirm('此题已有内容，是否使用 AI 答案替换？'); }
+            try { return window.confirm('此题已有内容，是否使用获取到的答案替换？'); }
             catch (_) { return false; }
         }
         return true;
@@ -808,7 +845,7 @@
                         if (typeof editor.sync === 'function') editor.sync();
                         dispatchValueEvents(textarea);
                         if (read() === expected) {
-                            verified = true; clickEditorSave(name); return current ? 'overwritten' : 'filled';
+                            verified = true; return current ? 'overwritten' : 'filled';
                         }
                     } finally {
                         if (!verified) {
@@ -836,7 +873,7 @@
                     if (expected.includes('\n')) body.style.whiteSpace = 'pre-wrap';
                     if (editorNodeText(body) !== expected) continue;
                     if ((textarea && !setFormValue(textarea, editorHtml(value))) || editorNodeText(body) !== expected) continue;
-                    verified = true; clickEditorSave(name);
+                    verified = true;
                     return current ? 'overwritten' : 'filled';
                 } finally {
                     if (!verified) {
@@ -854,7 +891,7 @@
             if (current === expected) return 'present';
             if (!allowOverwrite(current)) return 'skipped-existing';
             const oldValue = input.value;
-            if (setFormValue(input, value)) { clickEditorSave(name); return current ? 'overwritten' : 'filled'; }
+            if (setFormValue(input, value)) { return current ? 'overwritten' : 'filled'; }
             setFormValue(input, oldValue);
         }
         const editable = target.isContentEditable ? target : target.querySelector && target.querySelector('[contenteditable=true]');
@@ -869,7 +906,7 @@
         return false;
     }
 
-    function fillAnswersFromAI(answersData = {}) {
+    async function fillAnswersFromAI(answersData = {}) {
         ;
         ;
 
@@ -885,12 +922,12 @@
         let filledCount = 0;
         let matchedCount = 0;
 
-        questions.forEach((question, index) => {
+        for (const [index, question] of Array.from(questions).entries()) {
             const questionHash = question.dataset.questionId || `q-${index}`;
             const answerData = answersData[questionHash];
 
             if (!answerData || answerData.error || answerData.root !== question || !answerData.validate || !answerData.validate()) {
-                return;
+                continue;
             }
 
             const aiAnswer = answerData.answer;
@@ -903,7 +940,7 @@
                 const optionDivs = question.querySelectorAll('div.answerBg');
                 const canonical = aiAnswers.join('').toUpperCase().replace(/[\s,，、]/g, '');
                 if (!/^[A-Z]+$/.test(canonical) || (questionType === '单选题' && canonical.length !== 1) ||
-                    Array.from(canonical).some(letter => letter.charCodeAt(0) - 65 >= optionDivs.length)) return;
+                    Array.from(canonical).some(letter => letter.charCodeAt(0) - 65 >= optionDivs.length)) continue;
                 const answerLetters = Array.from(new Set(canonical.split('')));
 
                 if (questionType === '多选题') {
@@ -968,19 +1005,26 @@
                     answerData.skippedExisting = writes.includes('skipped-existing') && writes.every(Boolean);
                     filledCount += writes.filter(result => result === 'filled' || result === 'overwritten').length;
                     progressAnswer = aiAnswers.join('；') + (writes.includes('skipped-existing') ? '（已有内容，按覆盖策略未替换）' : writes.includes('overwritten') ? '（已替换原内容）' : '');
+                    if (matched) {
+                        reportProgress({ key: answerData.progressKey || questionHash, root: question, index: answerData.progressIndex || index + 1,
+                            question: answerData.questionText || '', answer: '内容已填入，正在点击保存…', state: 'pending' });
+                        const saved = await saveFilledQuestion(question, targets);
+                        answerData.saveClicked = saved.clicked;
+                        if (!saved.clicked) { matched = false; progressAnswer = saved.reason; }
+                    }
                 }
             }
             if (matched) {
                 matchedCount++;
                 reportProgress({ key: answerData.progressKey || questionHash, root: question, index: answerData.progressIndex || index + 1,
                     question: answerData.questionText || '',
-                    answer: `已填入：${progressAnswer}${answerData.needsReview ? '（模型建议核对）' : ''}`,
+                    answer: `${answerData.source || 'DeepSeek'} · ${answerData.saveClicked ? '已填入并点击保存' : '已填入'}：${progressAnswer}${answerData.needsReview ? '（模型建议核对）' : ''}`,
                     state: answerData.needsReview ? 'review' : 'success' });
             } else {
                 reportProgress({ key: answerData.progressKey || questionHash, root: question, index: answerData.progressIndex || index + 1,
                     question: answerData.questionText || '', answer: `未填入：${progressAnswer}`, state: 'error' });
             }
-        });
+        }
 
         ;
 
@@ -1001,8 +1045,9 @@
     }
     window.__cxUpstreamAI = {
         sourceCommit: '3b534edae5208f1b3bdb256142491a6cd28de4a0',
-        active: () => window.__cefDeepSeek.enabled() && isChaoxingExamPage(),
+        active: () => answeringEnabled() && isChaoxingExamPage(),
         fetchAllAnswers, handleCopyAIRequest, fillAnswersFromAI,
+        start: () => scheduleAutoAnswer(true),
         retryFailed: () => fetchAllAnswers({ failedOnly: true }),
         isPaused: () => answeringPaused,
         setPaused: setAnsweringPaused,

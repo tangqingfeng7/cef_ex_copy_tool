@@ -31,7 +31,7 @@ async function fixture(native = false) {
     });
     await page.goto('https://mooc1.chaoxing.com/exam-ans/exam/test/preview-balance');
     await page.evaluate(native => {
-        window.__CX_AI_CONFIG__ = { enabled: false, apiKey: 'fixture-private', baseUrl: 'https://api.deepseek.com' };
+        window.__CX_AI_CONFIG__ = { enabled: true, apiKey: 'fixture-private', baseUrl: 'https://api.deepseek.com' };
         if (native) window.__cefNativeAiProxy = { version: 1, balanceRead: true };
     }, native);
     await page.evaluate(decodeResource(readResource(fs.readFileSync(dll), 10, 201)).toString('utf8'));
@@ -40,7 +40,7 @@ async function fixture(native = false) {
         holdNextBalance() { let release; balanceGate = new Promise(resolve => { release = resolve; }); return release; } };
 }
 
-test('only answer/chat tabs remain and question-column images directly preview actual captured bytes', async () => {
+test('answer/chat/bank/settings tabs remain and question-column images directly preview actual captured bytes', async () => {
     const f = await fixture();
     try {
         await f.page.evaluate(async () => {
@@ -48,7 +48,7 @@ test('only answer/chat tabs remain and question-column images directly preview a
             __cefDeepSeek.progress({ index: 1, root: document.querySelector('#question'), question: '图片编程题', answer: result.list[0][0], state: 'success' });
         });
         const panel = f.page.locator('#cef-deepseek-settings');
-        assert.deepEqual(await panel.locator('.tabs button').allTextContents(), ['答题', '对话']);
+        assert.deepEqual(await panel.locator('.tabs button').allTextContents(), ['答题', '对话', '题库', '设置']);
         assert.equal(await panel.locator('#tabImages, #imagePane, #imageDiagnostics').count(), 0);
         const img = panel.locator('#progressBody td:nth-child(2) img');
         await img.scrollIntoViewIfNeeded();

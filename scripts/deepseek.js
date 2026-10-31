@@ -45,6 +45,8 @@
         input = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
         var c = {
             enabled: input.enabled === true || (input.enabled == null && typeof input.apiKey === 'string' && !!input.apiKey.trim()),
+            universalScriptEnabled: input.universalScriptEnabled !== false,
+            bankAnswerMode: input.bankAnswerMode === 'only' || input.bankAnswerMode === 'first' ? input.bankAnswerMode : 'off',
             apiKey: typeof input.apiKey === 'string' ? input.apiKey.trim() : '',
             baseUrl: typeof input.baseUrl === 'string' ? input.baseUrl.trim() : 'https://api.deepseek.com',
             model: typeof input.model === 'string' && input.model.trim() ? input.model.trim() : 'deepseek-flash',
@@ -69,11 +71,13 @@
     }
     var cfg;
     try { cfg = normalize(w.__CX_AI_CONFIG__); } catch (_) { cfg = normalize({}); stats.lastCode = 'CONFIG'; }
+    var universalScriptAtStartup = cfg.universalScriptEnabled;
     var diskConfig = Object.assign({}, cfg), configWriteTail = Promise.resolve();
     var hotkeySyncTail = Promise.resolve(), nativeHotkeyJob = Promise.resolve(false);
     var hotkeySyncState = 'unavailable', selectionPermit = null, pendingNativeSelection = null;
     try { delete w.__CX_AI_CONFIG__; } catch (_) { w.__CX_AI_CONFIG__ = null; }
     function enabled() { return cfg.enabled && cfg.mode !== 'legacy'; }
+    function answeringEnabled() { return cfg.bankAnswerMode !== 'off' || enabled(); }
     function endpoint(c) {
         var u;
         try { u = new URL(c.baseUrl); } catch (_) { throw fail('CONFIG', 'API 地址不是有效 URL'); }
@@ -84,7 +88,7 @@
         return /\/chat\/completions$/.test(base) ? base : base + '/chat/completions';
     }
     function safeStatus() {
-        return { enabled: enabled(), configured: !!cfg.apiKey, model: cfg.model, mode: cfg.mode, answerDelayMs: cfg.answerDelayMs, overwritePolicy: cfg.overwritePolicy, panelOpacity: panelOpacity, answeringPaused: cfg.answeringPaused,
+        return { bankAnswerMode: cfg.bankAnswerMode, bankAnswerEnabled: cfg.bankAnswerMode !== 'off', universalScriptEnabled: cfg.universalScriptEnabled, universalScriptAtStartup: universalScriptAtStartup, enabled: enabled(), configured: !!cfg.apiKey, model: cfg.model, mode: cfg.mode, answerDelayMs: cfg.answerDelayMs, overwritePolicy: cfg.overwritePolicy, panelOpacity: panelOpacity, answeringPaused: cfg.answeringPaused,
             active: running, queued: queue.length, requests: stats.requests, probeRequests: stats.probeRequests, cacheHits: stats.cacheHits,
             hotkeys: Object.assign({}, cfg.hotkeys), hotkeySync: hotkeySyncState,
             usage: Object.assign({}, tokenUsage), chatRequest: Object.assign({}, chatRequest),
@@ -181,6 +185,8 @@
     }
     function configure(input) {
         input = Object.assign({}, input);
+        if (!Object.prototype.hasOwnProperty.call(input, 'bankAnswerMode')) input.bankAnswerMode = cfg.bankAnswerMode;
+        if (!Object.prototype.hasOwnProperty.call(input, 'universalScriptEnabled')) input.universalScriptEnabled = cfg.universalScriptEnabled;
         if (!Object.prototype.hasOwnProperty.call(input, 'answeringPaused')) input.answeringPaused = cfg.answeringPaused;
         if (!Object.prototype.hasOwnProperty.call(input, 'panelOpacity')) input.panelOpacity = panelOpacity;
         if (!Object.prototype.hasOwnProperty.call(input, 'panelBounds')) input.panelBounds = cfg.panelBounds;
@@ -193,7 +199,7 @@
             balanceState = { message: 'API 余额 · 点击刷新查询', state: '', value: null, at: 0 }; renderBalance();
         }
         var controlsOnly = Object.keys(next).every(function (key) {
-            return ['answerDelayMs', 'overwritePolicy', 'concurrency', 'panelOpacity', 'answeringPaused', 'panelBounds', 'hotkeys'].indexOf(key) >= 0 || next[key] === cfg[key];
+            return ['answerDelayMs', 'overwritePolicy', 'concurrency', 'panelOpacity', 'answeringPaused', 'panelBounds', 'hotkeys', 'universalScriptEnabled'].indexOf(key) >= 0 || next[key] === cfg[key];
         });
         if (controlsOnly) {
             cfg = next; setOpacity(next.panelOpacity, false); drain();
@@ -610,9 +616,141 @@
         cache.set(key, { value: value, error: error, at: Date.now() }); cacheBytes += key.length * 2;
         while (cache.size > 24 || cacheBytes > 24 * 1024 * 1024) { var first = cache.keys().next().value; cache.delete(first); cacheBytes -= first.length * 2; }
     }
+    function cleanQuestionStem(value, type) {
+        var text = String(value || '').trim();
+        if (Number(type) === 3) {
+            // Some question banks paste an extra true/false option pair inside the heading.
+            // Remove only a complete trailing pair; preserve the actual proposition verbatim.
+            text = text.replace(/\s*A\s*[.、．:：]\s*(?:正确|错误|对|错|是|否|true|false|T|F|√|×)\s*[;；]?\s*B\s*[.、．:：]\s*(?:正确|错误|对|错|是|否|true|false|T|F|√|×)\s*[;；]?\s*$/i, '').trim();
+        }
+        return text;
+    }
+    function lookupBank(s) {
+        if (!w.__cefNativeAiProxy || !w.__cefNativeAiProxy.questionBank) return Promise.reject(fail('BANK_ERROR', '请更新 DLL 后使用本地题库答题'));
+        
+        // Strip only a recognized question-type heading, never arbitrary numeric content.
+        var alternate = cleanQuestionStem(s.question, s.type).replace(/^\s*(?:(?:第\s*)?\d+\s*[.、．:：]\s*)?[（(【\[]\s*(?:单选题|多选题|判断题|填空题|简答题|问答题|论述题|编程题|程序设计题)(?:\s*[,，]\s*\d+(?:\.\d+)?\s*分)?\s*[）)】\]]\s*/, '');
+        var type = expectedType(s);
+        var payload = { action: 'lookup', hasImages: s.images.length > 0, stem: s.question, alternateStem: alternate, type: type === 'judge' ? 'boolean' : type, blanks: s.blanks,
+            options: s.options.map(function (text, index) { return text.replace(new RegExp('^\\s*' + String.fromCharCode(65 + index) + '[.、．:：]\\s*'), ''); }) };
+        return new Promise(function (resolve, reject) {
+            var xhr = new XMLHttpRequest(), controller = new AbortController(); active.add(controller);
+            function finish(error, result) { active.delete(controller); controller.signal.removeEventListener('abort', abort); if (error) reject(error); else resolve(result); }
+            function abort() { xhr.abort(); }
+            controller.signal.addEventListener('abort', abort);
+            try {
+                xhr.open('POST', new URL('/__cef_cx_ai_proxy__/question-bank', w.location.origin).href, true); xhr.timeout = 15000;
+                xhr.setRequestHeader('Content-Type', 'application/json'); xhr.setRequestHeader('X-Cef-Cx-Question-Bank', '1');
+                xhr.onload = function () {
+                    try { var result = JSON.parse(xhr.responseText); if (xhr.status !== 200 || !result.ok) throw fail('BANK_ERROR', result.error || '本地题库查询失败'); finish(null, result); }
+                    catch (error) { finish(error.code ? error : fail('BANK_ERROR', '本地题库响应格式无效')); }
+                };
+                xhr.onerror = function () { finish(fail('BANK_ERROR', '无法连接本地题库')); };
+                xhr.ontimeout = function () { finish(fail('BANK_ERROR', '题库匹配超时，请缩小题库后重试')); };
+                xhr.onabort = function () { finish(fail('CANCELED', '题库查询已取消')); };
+                xhr.send(JSON.stringify(payload));
+            } catch (error) { finish(fail('BANK_ERROR', error.message || '无法查询本地题库')); }
+        });
+    }
+    async function bankImagePixels(url, signal) {
+        return new Promise(function (resolve, reject) {
+            var image = new Image(), timer = setTimeout(function () { finish(fail('BANK_IMAGE', '题图解码超时')); }, 15000);
+            function abort() { finish(fail('CANCELED', '图片匹配已取消')); }
+            function finish(error, value) { clearTimeout(timer); image.onload = image.onerror = null; signal.removeEventListener('abort', abort); if (error) reject(error); else resolve(value); }
+            signal.addEventListener('abort', abort);
+            image.onload = function () {
+                try {
+                    var canvas = doc.createElement('canvas'); canvas.width = canvas.height = 96;
+                    var context = canvas.getContext('2d'); context.fillStyle = '#fff'; context.fillRect(0, 0, 96, 96); context.drawImage(image, 0, 0, 96, 96);
+                    finish(null, { ratio: image.naturalWidth / image.naturalHeight, pixels: context.getImageData(0, 0, 96, 96).data });
+                } catch (_) { finish(fail('BANK_IMAGE', '无法读取题图像素，未填入')); }
+            };
+            image.onerror = function () { finish(fail('BANK_IMAGE', '题库图片无法解码，未填入')); };
+            if (signal.aborted) abort(); else image.src = url;
+        });
+    }
+    function sameBankImage(a, b) {
+        if (Math.abs(a.ratio / b.ratio - 1) > 0.02) return false;
+        var difference = 0, changed = 0, channels = 0;
+        for (var i = 0; i < a.pixels.length; i++) {
+            if (i % 4 === 3) continue;
+            var delta = Math.abs(a.pixels[i] - b.pixels[i]); difference += delta; if (delta > 24) changed++; channels++;
+        }
+        return difference / channels <= 3 && changed / channels <= 0.01;
+    }
+    async function matchImageBank(s, c, candidates) {
+        if (!candidates.length) return { matched: false, reason: 'not-found' };
+        var controller = new AbortController(); active.add(controller);
+        var timer = setTimeout(function () { controller.abort(); }, 60000);
+        try {
+            var pageGroups = { stem: [] }, images = new Map();
+            for (var i = 0; i < s.images.length; i++) {
+                if (!isCurrent(s) || controller.signal.aborted) throw fail('CANCELED', '图片匹配已取消');
+                var item = s.images[i], option = /^选项 ([A-Z]) 图片$/.exec(item.label), group = option ? option[1] : 'stem';
+                var url = await captureImage(item, controller, c);
+                if (!pageGroups[group]) pageGroups[group] = [];
+                pageGroups[group].push(await bankImagePixels(url, controller.signal));
+            }
+            function plainImageText(value) { return String(value || '').replace(/\[图片:[^\]]+\]|\[附图\]/g, '').replace(/\s+/g, ' ').trim(); }
+            async function equalGroup(value, page) {
+                var ids = [], pattern = /\[图片:([^\]]+)\]/g, match;
+                while ((match = pattern.exec(value))) ids.push(match[1]);
+                page = page || [];
+                if (ids.length !== page.length) return false;
+                for (var j = 0; j < ids.length; j++) {
+                    var data = images.get(ids[j]);
+                    if (!data || !sameBankImage(await bankImagePixels(data, controller.signal), page[j])) return false;
+                }
+                return true;
+            }
+            var accepted = null, bank = '';
+            for (var n = 0; n < candidates.length; n++) {
+                var candidate = candidates[n], q = candidate.question; images.clear();
+                q.images.forEach(function (image) { images.set(image.id, image.dataUrl); });
+                if (!await equalGroup(q.stem, pageGroups.stem)) continue;
+                var type = expectedType(s), raw = { type: type, needsReview: false };
+                if (type === 'single' || type === 'multiple') {
+                    if (q.options.length !== s.options.length) continue;
+                    var mapping = {}, positions = new Set(), valid = true;
+                    for (var o = 0; o < q.options.length; o++) {
+                        var matches = [];
+                        for (var k = 0; k < s.options.length; k++) {
+                            var label = String.fromCharCode(65 + k), pageText = s.options[k].replace(new RegExp('^\\s*' + label + '[.、．:：]\\s*'), '');
+                            if (plainImageText(q.options[o].text) === plainImageText(pageText) && await equalGroup(q.options[o].text, pageGroups[label])) matches.push(label);
+                        }
+                        if (matches.length !== 1 || positions.has(matches[0])) { valid = false; break; }
+                        mapping[q.options[o].id] = matches[0]; positions.add(matches[0]);
+                    }
+                    if (!valid) continue;
+                    raw.choices = q.answer.map(function (id) { return mapping[id]; }).sort();
+                } else if (type === 'judge') raw.answers = [q.answer ? '正确' : '错误'];
+                else if (type === 'blank') { if (q.answer.length !== s.blanks) continue; raw.answers = q.answer.map(function (variants) { return variants[0]; }); }
+                else raw.answers = [q.answer];
+                if (/\[图片:[^\]]+\]/.test(JSON.stringify(raw))) continue;
+                if (candidate.conflict || accepted && JSON.stringify(accepted) !== JSON.stringify(raw)) return { matched: false, reason: 'ambiguous' };
+                accepted = raw; bank = candidate.bank;
+            }
+            if (!isCurrent(s) || controller.signal.aborted) throw fail('STALE', '题目已变化，图片结果不会填入');
+            return accepted ? { matched: true, answer: accepted, bank: bank + '（图片已核对）' } : { matched: false, reason: 'image-mismatch' };
+        } finally { clearTimeout(timer); active.delete(controller); }
+    }
     async function execute(s, c) {
         if (!isCurrent(s)) throw fail('STALE', '题目或配置已变化，旧结果不会填充');
-        if (!c.apiKey) throw fail('NO_KEY', '未配置 API Key，请按 Ctrl+G');
+        var bankMiss = false;
+        if (!s.textMode && c.bankAnswerMode !== 'off') {
+            var local = await lookupBank(s);
+            if (local.candidates) local = await matchImageBank(s, c, local.candidates);
+            if (!isCurrent(s)) throw fail('STALE', '题目或设置已变化，题库答案不会填入');
+            if (local.matched) {
+                var bankAnswer = validateAnswer(local.answer, s); bankAnswer.source = '本地题库 · ' + local.bank;
+                bankAnswer.msg = '本地题库命中'; stats.status = 'ready'; stats.lastCode = null; return bankAnswer;
+            }
+            if (local.reason === 'ambiguous') throw fail('BANK_AMBIGUOUS', '题库答案有冲突或匹配不明确，已跳过');
+            if (c.bankAnswerMode === 'only' || !enabled()) throw fail('BANK_MISS', local.reason === 'image-mismatch' ? '题库图片与当前题图不一致，已跳过' : '本地题库未命中，已跳过');
+            bankMiss = true;
+        }
+        if (!enabled()) throw fail('DISABLED', 'DeepSeek 已关闭');
+        if (!c.apiKey) throw fail('NO_KEY', bankMiss ? '题库未命中，且未配置 DeepSeek Key，已跳过' : '未配置 API Key，请按 Ctrl+G');
         var target = endpoint(c), controller = new AbortController(), timedOut = false;
         active.add(controller);
         var timer = setTimeout(function () { timedOut = true; controller.abort(); }, c.timeoutMs);
@@ -661,7 +799,7 @@
                 var payload = choice.message.content.trim(), fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(payload);
                 if (fenced) payload = fenced[1];
                 try { parsed = JSON.parse(payload); } catch (_) { throw fail('FORMAT', 'AI 未返回有效 JSON，不会自动填充；代码必须放入 answers 的单个字符串'); }
-                var result = validateAnswer(parsed, s); cachePut(key, result, null); stats.status = 'ready'; stats.lastCode = null; return result;
+                var result = validateAnswer(parsed, s); result.source = bankMiss ? '题库未命中 → DeepSeek' : 'DeepSeek'; cachePut(key, result, null); stats.status = 'ready'; stats.lastCode = null; return result;
             } catch (error) {
                 if (error.code && error.code !== 'CANCELED' && error.code !== 'STALE') cachePut(key, null, error);
                 throw error;
@@ -807,6 +945,7 @@
         }
     }
     async function executeChat(messages, c, options) {
+        if (!enabled()) throw fail('DISABLED', 'DeepSeek 已关闭，请在设置中开启');
         options = options || {};
         if (!c.apiKey) throw fail('NO_KEY', '未配置 API Key，请按 Ctrl+G');
         var target = endpoint(c), normalized = normalizeChatMessages(messages);
@@ -847,6 +986,7 @@
         }
     }
     function chat(messages, options) {
+        if (!enabled()) return Promise.reject(fail('DISABLED', 'DeepSeek 已关闭，请在设置中开启'));
         var c = cfg; options = options || {};
         chatRequest = { state: 'queued', queuedAt: Date.now(), startedAt: 0, firstByteAt: 0, finishedAt: 0, usage: null }; renderRequestStats();
         return schedule(function () { return executeChat(messages, c, options); }, options.signal).catch(function (error) {
@@ -965,22 +1105,115 @@
         if (w.requestAnimationFrame) chatRenderFrame = w.requestAnimationFrame(flush);
         chatRenderTimer = setTimeout(flush, 100);
     }
+    // Model output is rendered with DOM text nodes; only the trusted formula renderer emits HTML.
+    function chatInline(parent, text) {
+        var pattern = /(`+)([\s\S]*?)\1|\*\*([^*]+)\*\*|\$\$([^$]+)\$\$|\$([^$\n]+)\$|\\\(([\s\S]*?)\\\)|\\\[([\s\S]*?)\\\]/g, match, offset = 0;
+        while ((match = pattern.exec(text))) {
+            parent.appendChild(doc.createTextNode(text.slice(offset, match.index)));
+            var node = doc.createElement(match[1] ? 'code' : match[3] ? 'strong' : 'span');
+            var formula = match[4] || match[5] || match[6] || match[7];
+            if (formula && typeof cefChatMath !== 'undefined') {
+                try { node.innerHTML = cefChatMath.renderToString(formula, { displayMode: !!(match[4] || match[7]), throwOnError: false, trust: false, maxExpand: 200, maxSize: 20, strict: 'ignore' }); }
+                catch (_) { node.textContent = match[0]; }
+            } else node.textContent = match[2] || match[3] || match[0];
+            parent.appendChild(node); offset = pattern.lastIndex;
+        }
+        parent.appendChild(doc.createTextNode(text.slice(offset)));
+    }
+    async function copyChatCode(text, button) {
+        try {
+            if (w.navigator.clipboard && w.navigator.clipboard.writeText) await w.navigator.clipboard.writeText(text);
+            else throw new Error('fallback');
+        } catch (_) {
+            var active = dialog.panel.activeElement, area = doc.createElement('textarea');
+            area.value = text; area.style.cssText = 'position:fixed;opacity:0;pointer-events:none'; dialog.panel.appendChild(area);
+            area.focus(); area.select();
+            var copied = false;
+            try { copied = doc.execCommand('copy'); } catch (_) {}
+            area.remove(); if (active && active.focus) active.focus();
+            if (!copied) { button.textContent = '复制失败，请手动选择'; return; }
+        }
+        button.textContent = '已复制'; setTimeout(function () { button.textContent = '复制代码'; }, 1500);
+    }
+    var chatCodeWrap = new WeakMap();
+    function renderChatText(parent, text) {
+        var wrapStates = chatCodeWrap.get(parent);
+        if (!wrapStates) { wrapStates = {}; chatCodeWrap.set(parent, wrapStates); }
+        var codeIndex = 0;
+        parent.textContent = '';
+        var lines = text.split('\n'), i = 0;
+        while (i < lines.length) {
+            var fence = /^\s*(`{3,}|~{3,})(.*)$/.exec(lines[i]);
+            if (fence) {
+                var codeLines = [], marker = fence[1]; i++;
+                while (i < lines.length && !(new RegExp('^\\s*' + marker[0] + '{' + marker.length + ',}\\s*$')).test(lines[i])) codeLines.push(lines[i++]);
+                if (i < lines.length) i++;
+                var block = doc.createElement('div'), toolbar = doc.createElement('div'), label = doc.createElement('span'), button = doc.createElement('button'), pre = doc.createElement('pre'), code = doc.createElement('code');
+                block.className = 'chat-code'; toolbar.className = 'chat-code-toolbar'; label.textContent = fence[2].trim() || '代码';
+                button.type = 'button'; button.textContent = '复制代码'; code.textContent = codeLines.join('\n');
+                button.onclick = (function (value, control) { return function () { copyChatCode(value, control); }; })(code.textContent, button);
+                var wrapButton = doc.createElement('button'), actions = doc.createElement('div'), index = codeIndex++;
+                actions.className = 'chat-code-actions'; wrapButton.type = 'button';
+                (function (container, control, key) {
+                    function applyWrap() {
+                        var wrapped = wrapStates[key] !== false;
+                        container.setAttribute('data-wrap', String(wrapped));
+                        control.textContent = wrapped ? '不换行' : '自动换行';
+                        control.title = wrapped ? '切换为原始行宽，横向滚动查看' : '按面板宽度换行，显示完整代码';
+                        control.setAttribute('aria-label', '代码自动换行');
+                        control.setAttribute('aria-pressed', String(wrapped));
+                    }
+                    control.onclick = function () { wrapStates[key] = wrapStates[key] === false; applyWrap(); };
+                    applyWrap();
+                })(block, wrapButton, index);
+                toolbar.appendChild(label); actions.appendChild(wrapButton); actions.appendChild(button); toolbar.appendChild(actions);
+                pre.appendChild(code); block.appendChild(toolbar); block.appendChild(pre); parent.appendChild(block); continue;
+            }
+            if (/^\s*(\$\$|\\\[)/.test(lines[i])) {
+                var math = lines[i++], closing = math.trim().indexOf('$$') === 0 ? '$$' : '\\]';
+                if (math.trim() === '$$' || math.trim() === '\\[' || !math.trim().endsWith(closing)) {
+                    while (i < lines.length) { var line = lines[i++]; math += '\n' + line; if (line.trim().endsWith(closing)) break; }
+                }
+                var equation = doc.createElement('div'); chatInline(equation, math); parent.appendChild(equation); continue;
+            }
+            var list = /^\s*(?:([-+*])|\d+[.)])\s+(.+)$/.exec(lines[i]);
+            if (list) {
+                var ordered = !list[1], group = doc.createElement(ordered ? 'ol' : 'ul');
+                if (ordered) group.start = parseInt(lines[i].trim(), 10);
+                while (i < lines.length && (list = /^\s*(?:([-+*])|\d+[.)])\s+(.+)$/.exec(lines[i])) && ordered === !list[1]) {
+                    var item = doc.createElement('li'); chatInline(item, list[2]); group.appendChild(item); i++;
+                }
+                parent.appendChild(group); continue;
+            }
+            var heading = /^(#{1,6})\s+(.+)$/.exec(lines[i]), paragraph = doc.createElement(heading ? 'h' + heading[1].length : 'div');
+            chatInline(paragraph, heading ? heading[2] : lines[i] || '\u00a0'); parent.appendChild(paragraph); i++;
+        }
+    }
+    function updateChatLatest() {
+        if (!dialog) return;
+        var log = dialog.panel.getElementById('chatLog'), button = dialog.panel.getElementById('chatLatest');
+        button.hidden = log.scrollHeight - log.clientHeight - log.scrollTop < 48;
+    }
     function renderChat() {
         cancelChatRender();
         if (!dialog) return;
         var log = dialog.panel.getElementById('chatLog'), images = dialog.panel.getElementById('chatImages');
         if (!log || !images) return;
+        var follow = log.scrollHeight - log.clientHeight - log.scrollTop < 48;
         var next = log.firstChild, changed = false;
         chatHistory.forEach(function (message) {
             var view = chatViews.get(message);
             if (!view) {
                 var bubble = doc.createElement('div'); bubble.className = 'chat-message ' + message.role;
-                var content = doc.createTextNode(''); bubble.appendChild(content);
+                var content = doc.createElement('div'); content.className = 'chat-rich'; bubble.appendChild(content);
                 view = { bubble: bubble, content: content, note: null }; chatViews.set(message, view);
             }
             var text = message.display || (typeof message.content === 'string' ? message.content : '[图片消息]');
             if (message.pending && !text) text = '等待回复…';
-            if (view.content.nodeValue !== text) { view.content.nodeValue = text; changed = true; }
+            if (view.text !== text) {
+                if (message.role === 'assistant') renderChatText(view.content, text); else view.content.textContent = text;
+                view.text = text; changed = true;
+            }
             if (message.note) {
                 if (!view.note) { view.note = doc.createElement('div'); view.note.className = 'muted'; view.bubble.appendChild(view.note); changed = true; }
                 if (view.note.textContent !== message.note) { view.note.textContent = message.note; changed = true; }
@@ -1002,10 +1235,12 @@
         images.hidden = chatImages.length === 0;
         dialog.panel.getElementById('chatStop').disabled = !chatBusy;
         dialog.panel.getElementById('chatSend').disabled = chatBusy;
-        if (changed) log.scrollTop = log.scrollHeight;
+        if (changed && follow) log.scrollTop = log.scrollHeight;
+        updateChatLatest();
     }
     async function sendChatMessage() {
         if (!dialog || chatBusy) return;
+        if (!enabled()) { reportStatus('DeepSeek 已关闭，请在设置中开启', 'error'); dialog.panel.getElementById('tabSettings').click(); return; }
         var input = dialog.panel.getElementById('chatInput'), text = input.value.trim();
         if (!text && !chatImages.length) return;
         if (!text) text = '请分析这张图片。';
@@ -1233,6 +1468,133 @@
         }
         var paused = w.__cxUpstreamAI.togglePause(); updatePauseControl(paused); return paused;
     }
+    function installQuestionBank(panel) {
+        function field(id) { return panel.getElementById(id); }
+        var busy = false, connected = false, importWarnings = [];
+        function message(text, error) { field('bankStatus').textContent = text; field('bankStatus').setAttribute('data-state', error ? 'error' : ''); }
+        function controls() {
+            ['bankImport', 'bankImportFormat', 'bankSearch', 'bankStart'].forEach(function (id) { field(id).disabled = busy || !connected; });
+            field('bankQuery').disabled = busy || !connected;
+        }
+        function update(state) {
+            connected = state.connected === true;
+            field('bankSummary').textContent = connected ? '默认题库 · ' + state.count + ' 道题 · ' + state.conflicts + ' 条冲突记录' : '默认题库尚未就绪';
+            field('bankPath').textContent = connected ? state.path : '默认位置：' + (state.defaultPath || 'DLL 所在目录');
+            if (state.connectionError) message(state.connectionError, true);
+            controls();
+        }
+        function request(action, values) {
+            if (!w.__cefNativeAiProxy || !w.__cefNativeAiProxy.questionBank) return Promise.reject(new Error('请先替换支持 SQLite 题库的 DLL，再重启客户端'));
+            return new Promise(function (resolve, reject) {
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', new URL('/__cef_cx_ai_proxy__/question-bank', w.location.origin).href, true);
+                xhr.timeout = 120000;
+                xhr.setRequestHeader('Content-Type', 'application/json'); xhr.setRequestHeader('X-Cef-Cx-Question-Bank', '1');
+                xhr.onload = function () {
+                    try {
+                        var result = JSON.parse(xhr.responseText);
+                        if (xhr.status !== 200 || result.ok !== true) throw new Error(result.error || '本地题库请求失败');
+                        resolve(result);
+                    } catch (error) { reject(error); }
+                };
+                xhr.onerror = function () { reject(new Error('无法连接本地题库通道，请确认在支持的客户端页面中打开面板')); };
+                xhr.ontimeout = function () { reject(new Error('题库操作超时，请重新打开题库页查看状态后再操作')); };
+                xhr.onabort = function () { reject(new Error('题库操作已取消')); };
+                xhr.send(JSON.stringify(Object.assign({ action: action }, values || {})));
+            });
+        }
+        async function run(action, values) {
+            if (busy) return;
+            busy = true; controls();
+            message(action === 'import' ? '正在导入，请稍候…' : '正在处理…');
+            try {
+                var result = await request(action, values);
+                if (action === 'search') {
+                    renderResults(result.questions || []);
+                    message('显示 ' + result.questions.length + ' 道题' + (result.more ? '，还有更多结果，请缩小关键词范围' : ''));
+                } else {
+                    update(result);
+                    if (action === 'import') {
+                        clear('题库内容已变化');
+                        if (connected && cfg.bankAnswerMode !== 'off') doc.dispatchEvent(new CustomEvent('cef-ai-config-changed'));
+                    }
+                    if (action !== 'status') field('bankResults').textContent = '';
+                    if (action === 'import') message('导入完成：新增 ' + result.inserted + '，重复跳过 ' + result.duplicates + '，冲突保留 ' + result.importConflicts + (importWarnings.length ? '\n需核对：\n' + importWarnings.join('\n') : ''));
+                    else if (!result.connectionError) message(result.connected ? '默认题库已就绪，导入数据后即可使用' : '默认题库尚未就绪，请检查目录写入权限');
+                }
+            } catch (error) { message(error.message || '题库操作失败', true); }
+            finally { busy = false; controls(); }
+        }
+        function renderResults(questions) {
+            var root = field('bankResults'); root.textContent = '';
+            questions.forEach(function (q) {
+                var item = doc.createElement('details'), title = doc.createElement('summary'), meta = doc.createElement('div');
+                item.className = 'bank-result'; title.textContent = q.stem; item.appendChild(title);
+                meta.className = 'note'; meta.textContent = q.bank + ' · ' + ({ single: '单选', multiple: '多选', boolean: '判断', blank: '填空', text: '简答' }[q.type] || q.type); item.appendChild(meta);
+                (q.options || []).forEach(function (option) { var row = doc.createElement('div'); row.textContent = option.id + '. ' + option.text; item.appendChild(row); });
+                var answer = doc.createElement('div'); answer.className = 'bank-answer';
+                var value = q.answer;
+                if (q.type === 'boolean') value = value ? '正确' : '错误';
+                else if (q.type === 'single' || q.type === 'multiple') value = value.map(function (id) { var option = q.options.find(function (o) { return o.id === id; }); return id + (option ? '. ' + option.text : ''); }).join('\n');
+                else if (q.type === 'blank') value = value.map(function (variants, index) { return '第 ' + (index + 1) + ' 空：' + variants.join(' / '); }).join('\n');
+                answer.textContent = '答案：\n' + String(value); item.appendChild(answer);
+                if (q.explanation) { var explanation = doc.createElement('div'); explanation.className = 'bank-answer'; explanation.textContent = '解析：\n' + q.explanation; item.appendChild(explanation); }
+                if (q.source) { var source = doc.createElement('div'); source.className = 'note'; source.textContent = '来源：' + q.source; item.appendChild(source); }
+                (q.images || []).forEach(function (image) {
+                    var figure = doc.createElement('div'), caption = doc.createElement('div'), picture = doc.createElement('img');
+                    caption.textContent = '[图片:' + image.id + ']'; caption.className = 'note'; picture.src = image.dataUrl; picture.alt = image.id;
+                    picture.style.cssText = 'display:block;max-width:100%;height:auto;margin:5px 0';
+                    figure.appendChild(caption); figure.appendChild(picture); item.appendChild(figure);
+                });
+                root.appendChild(item);
+            });
+        }
+        field('bankAnswerMode').value = cfg.bankAnswerMode;
+        field('bankAnswerMode').onchange = function () {
+            var mode = field('bankAnswerMode').value;
+            configure(Object.assign({}, cfg, { bankAnswerMode: mode }));
+            rememberPreference('bankAnswerMode', mode, true);
+            message(mode === 'off' ? '本地题库答题已关闭' : mode === 'only' ? '仅本地题库答题已开启，不调用 AI；未命中会跳过' : '题库优先已开启；仅在 DeepSeek 开启且配置 Key 时回退到 AI');
+        };
+        field('bankStart').onclick = function () {
+            if (!w.__cxUpstreamAI || !w.__cxUpstreamAI.start) { message('当前页面不支持自动填写，请进入超星答题页面后操作', true); return; }
+            if (cfg.bankAnswerMode === 'off') { field('bankAnswerMode').value = 'only'; field('bankAnswerMode').onchange(); }
+            w.__cxUpstreamAI.setPaused(false); w.__cxUpstreamAI.start();
+            field('tabAnswer').click();
+        };
+        field('bankSearch').onclick = function () { run('search', { query: field('bankQuery').value.trim() }); };
+        field('bankQuery').onkeydown = function (event) { if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); field('bankSearch').click(); } };
+        field('bankImportFormat').onchange = function () {
+            field('bankImport').textContent = field('bankImportFormat').value === 'docx' ? '导入 Word 题库' : '导入 JSON 题库';
+        };
+        field('bankImport').onclick = function () {
+            var format = field('bankImportFormat').value;
+            field('bankFile').accept = format === 'docx' ? '.docx' : '.json';
+            field('bankFile').value = ''; field('bankFile').click();
+        };
+        field('bankFile').onchange = async function () {
+            var file = field('bankFile').files[0]; field('bankFile').value = '';
+            if (!file || busy) return;
+            busy = true; controls(); message('正在读取导入文件…');
+            try {
+                if (file.size > 8 * 1024 * 1024) throw new Error('每次导入的文件不能超过 8 MiB');
+                var isWord = /\.docx$/i.test(file.name); importWarnings = [];
+                if (!isWord && !/\.json$/i.test(file.name)) throw new Error('请选择 .docx 或 .json 文件；旧版 .doc 请先另存为 .docx');
+                var content = await new Promise(function (resolve, reject) { var reader = new FileReader(); reader.onload = function () { resolve(reader.result); }; reader.onerror = function () { reject(new Error('无法读取所选文件')); }; if (isWord) reader.readAsArrayBuffer(file); else reader.readAsText(file, 'utf-8'); });
+                var payload;
+                if (isWord) {
+                    if (!w.__cefParseBankDocx) throw new Error('Word 导入模块未就绪，请更新 DLL 并重启');
+                    message('正在解析 Word 题目和图片…');
+                    var parsed = w.__cefParseBankDocx(new Uint8Array(content), file.name); payload = parsed.payload; importWarnings = parsed.warnings;
+                } else payload = JSON.parse(String(content).replace(/^\uFEFF/, ''));
+                if (new Blob([JSON.stringify(payload)]).size > 9 * 1024 * 1024) throw new Error('解析后的题库超过 9 MiB，请拆分文档或压缩图片后导入');
+                busy = false; await run('import', { payload: payload });
+            } catch (error) { message('导入失败：' + error.message, true); }
+            finally { busy = false; controls(); }
+        };
+        controls();
+        return function () { run('status'); };
+    }
     function openSettings() {
         if (!doc || !doc.body) return;
         if (panelVisible()) return;
@@ -1255,30 +1617,40 @@
         panel.innerHTML = '<style>' +
             ':host{font:13px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;color:#20242b}*{box-sizing:border-box}section{height:100%;background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 8px 28px rgba(15,23,42,.14);display:flex;flex-direction:column;overflow:hidden}' +
             'header{height:48px;padding:0 16px;display:flex;align-items:center;justify-content:space-between;cursor:move;touch-action:none;user-select:none;flex-shrink:0}header strong{font-size:14px;font-weight:600;letter-spacing:.1px}' +
-            'button,input,select{font:inherit;outline:none}button{appearance:none;-webkit-appearance:none;border:1px solid #e2e8f0;border-radius:7px;background:#fff;color:#475569;padding:7px 12px;cursor:pointer;line-height:1.4}button:hover{background:#f8fafc}button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid #93c5fd;outline-offset:2px}button:disabled{opacity:.55;cursor:wait}#dismiss{border:0;background:transparent;color:#94a3b8;font-size:20px;padding:0;width:24px;height:28px}.content{flex:1;min-height:0;overflow:auto;padding:0 16px 12px}' +
-            '.content::-webkit-scrollbar,.chat-log::-webkit-scrollbar{width:4px;height:4px}.content::-webkit-scrollbar-thumb,.chat-log::-webkit-scrollbar-thumb{background:#dbe1e8;border-radius:4px}.content::-webkit-scrollbar-track,.chat-log::-webkit-scrollbar-track{background:transparent}.content::-webkit-scrollbar-button,.chat-log::-webkit-scrollbar-button{display:none;width:0;height:0}.content::-webkit-scrollbar-corner,.chat-log::-webkit-scrollbar-corner{background:transparent}.row{display:flex;align-items:center;justify-content:space-between}.enable-row{margin:0 0 8px}.muted{font-size:11px;color:#94a3b8}.field{display:block;margin:0 0 8px;color:#64748b;font-size:12px}.control{display:block;width:100%;height:36px;margin-top:6px;padding:7px 10px;border:1px solid #e2e8f0;border-radius:7px;background:#fff;color:#334155;appearance:none;-webkit-appearance:none}.control:focus{border-color:#93b5f5;box-shadow:0 0 0 2px #eff6ff}.control::placeholder{color:#a1aab6;font-size:12px}.answer-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 8px}.answer-setting{display:block;color:#64748b;font-size:11px}.delay-control{height:36px;margin-top:6px;padding:0 9px;display:flex;align-items:center;border:1px solid #e2e8f0;border-radius:7px;background:#fff}.delay-control:focus-within{border-color:#93b5f5;box-shadow:0 0 0 2px #eff6ff}.delay-control input{min-width:0;width:100%;border:0;padding:0;background:transparent;color:#334155}.delay-control em{font-style:normal;color:#94a3b8}.answer-setting #pause{width:100%;height:36px;margin-top:6px;padding:6px 8px}#pause[data-paused=true]{background:#ecfdf5;border-color:#86d7ba;color:#13795b}' +
-            '#enabled{appearance:none;-webkit-appearance:none;width:30px;height:18px;margin:0;border:0;border-radius:20px;background:#cbd5e1;position:relative;cursor:pointer;vertical-align:middle}#enabled:before{content:"";position:absolute;left:2px;top:2px;width:14px;height:14px;background:#fff;border-radius:50%;box-shadow:0 1px 3px #0002}#enabled:checked{background:#3b82f6}#enabled:checked:before{left:14px}.actions{display:flex;margin:4px 0 8px}.actions button{flex:1}.actions button+button{margin-left:8px}#save{background:#3379ed;border-color:#3379ed;color:#fff}#save:hover{background:#2867d2}' +
+            'button,input,select,textarea{font:inherit;outline:none;color:inherit}button{appearance:none;-webkit-appearance:none;border:1px solid #e2e8f0;border-radius:7px;background:#fff;color:#475569;padding:7px 12px;cursor:pointer;line-height:1.4}button:hover{background:#f8fafc}button:focus,input:focus,select:focus,textarea:focus,summary:focus{outline:none;box-shadow:none}button:focus-visible,summary:focus-visible,.feature-toggle:focus-visible{outline:1px solid #94a3b8;outline-offset:3px}button:disabled{opacity:.55;cursor:wait}#dismiss{border:0;background:transparent;color:#94a3b8;font-size:20px;padding:0;width:24px;height:28px}.content{flex:1;min-height:0;overflow:auto;padding:0 16px 12px}' +
+            '.content::-webkit-scrollbar,.chat-log::-webkit-scrollbar{width:4px;height:4px}.content::-webkit-scrollbar-thumb,.chat-log::-webkit-scrollbar-thumb{background:#dbe1e8;border-radius:4px}.content::-webkit-scrollbar-track,.chat-log::-webkit-scrollbar-track{background:transparent}.content::-webkit-scrollbar-button,.chat-log::-webkit-scrollbar-button{display:none;width:0;height:0}.content::-webkit-scrollbar-corner,.chat-log::-webkit-scrollbar-corner{background:transparent}.row{display:flex;align-items:center;justify-content:space-between}.enable-row{margin:0 0 8px}.muted{font-size:11px;color:#94a3b8}.field{display:block;margin:0 0 8px;color:#64748b;font-size:12px}.control{display:block;width:100%;height:36px;margin-top:6px;padding:7px 10px;border:1px solid #e2e8f0;border-radius:7px;background:#fff;color:#334155;appearance:none;-webkit-appearance:none}.control:focus{border-color:#cbd5e1;box-shadow:none}.control::placeholder{color:#a1aab6;font-size:12px}.answer-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 8px}.answer-setting{display:block;color:#64748b;font-size:11px}.delay-control{height:36px;margin-top:6px;padding:0 9px;display:flex;align-items:center;border:1px solid #e2e8f0;border-radius:7px;background:#fff}.delay-control:focus-within{border-color:#cbd5e1;box-shadow:none}.delay-control input{min-width:0;width:100%;border:0;padding:0;background:transparent;color:#334155}.delay-control em{font-style:normal;color:#94a3b8}.answer-setting #pause{width:100%;height:36px;margin-top:6px;padding:6px 8px}#pause[data-paused=true]{background:#ecfdf5;border-color:#86d7ba;color:#13795b}' +
+            '.feature-toggle{flex-shrink:0;appearance:none;-webkit-appearance:none;width:32px;height:18px;margin:0;border:0;border-radius:20px;background:#f1f5f9;box-shadow:inset 0 0 0 1px #e2e8f0;position:relative;cursor:pointer;vertical-align:middle}.feature-toggle:before{content:"";position:absolute;left:2px;top:2px;width:14px;height:14px;background:#fff;border-radius:50%;box-shadow:0 0 0 1px #e2e8f0}.feature-toggle:checked{background:#e2e8f0}.feature-toggle:checked:before{left:14px}.actions{display:flex;margin:4px 0 8px}.actions button{flex:1}.actions button+button{margin-left:8px}#save{background:#f8fafc;border-color:#e2e8f0;color:#475569}#save:hover{background:#f1f5f9}' +
             '.tools{display:flex;align-items:center;margin-bottom:8px}.tools button{font-size:12px;padding:0;border:0;color:#64748b;background:transparent}.tools span{margin-left:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}details{border-top:1px solid #f1f5f9;margin-top:8px;padding-top:8px}summary{cursor:pointer;color:#64748b;font-size:12px;list-style:none}summary::-webkit-details-marker{display:none}summary:after{content:"›";float:right;color:#94a3b8}details[open] summary{margin-bottom:12px}details[open] summary:after{content:"⌄"}.secondary-actions{display:flex;justify-content:space-between}.secondary-actions button{border:0;background:transparent;padding:2px 0;font-size:12px;color:#64748b}#clear{color:#b55b60}.note{font-size:11px;color:#94a3b8;margin:8px 0 0;line-height:1.6}#status{font-size:12px;line-height:1.5;color:#64748b;margin:10px 0 0;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word}#status[data-state=error]{color:#c05050}#status[data-state=success]{color:#23866a}.progress{margin-top:12px;border-top:1px solid #f1f5f9;padding-top:9px}.progress-title{font-size:12px;color:#64748b;margin-bottom:6px}.progress table{width:100%;border-collapse:collapse;table-layout:fixed;font-size:11px}.progress th,.progress td{text-align:left;vertical-align:top;padding:6px 4px;border-bottom:1px solid #f1f5f9;word-break:break-word}.progress th:first-child,.progress td:first-child{width:28px}.progress th:last-child,.progress td:last-child{width:94px}.progress tr[data-state=pending] td:last-child{color:#64748b}.progress tr[data-state=success] td:last-child{color:#23866a}.progress tr[data-state=review] td:last-child{color:#b7791f}.progress tr[data-state=error] td:last-child{color:#c05050}' +
-            '.tabs{display:flex;flex-shrink:0;gap:6px;margin:0 16px 12px;padding:3px;background:#f3f6fa;border-radius:9px}.tabs button{flex:1;border:0;padding:6px;background:transparent}.tabs button[data-active=true]{background:#fff;color:#2563eb;box-shadow:0 1px 4px #0f172a12}.pane[hidden]{display:none!important}.chat-log{height:265px;overflow:auto;padding:4px 0 8px}.chat-message{max-width:88%;margin:7px 0;padding:8px 10px;border-radius:10px;white-space:pre-wrap;word-break:break-word;background:#f1f5f9;color:#334155}.chat-message.user{margin-left:auto;background:#eaf2ff}.chat-message.assistant{margin-right:auto}.chat-images{display:flex;gap:5px;flex-wrap:wrap;margin:4px 0 7px}.chat-images span{font-size:11px;padding:3px 6px;border-radius:12px;background:#eef2f7;color:#64748b}.chat-images button{border:0;background:transparent;padding:0;color:#94a3b8}.chat-compose textarea{width:100%;height:64px;resize:none;border:1px solid #e2e8f0;border-radius:8px;padding:8px;color:#334155}.chat-actions{display:flex;justify-content:space-between;margin-top:7px}.chat-actions #chatSend{background:#3379ed;border-color:#3379ed;color:#fff}.paste-hint{font-size:11px;color:#94a3b8;margin-top:5px}' +
-            'footer{padding:10px 16px 10px;border-top:1px solid #f1f5f9;flex-shrink:0;color:#94a3b8;font-size:11px}footer .row{margin-bottom:5px}#opacity{appearance:none;-webkit-appearance:none;display:block;width:100%;height:4px;padding:0;margin:6px 0;border:0;border-radius:10px;background:#e7ebf0;cursor:pointer}#opacity::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:11px;height:11px;border:0;border-radius:50%;background:#94a3b8}#files{display:none}.answer-value{max-height:none;white-space:pre-wrap;font-size:14px;line-height:1.65}.progress table,.progress thead,.progress tbody{display:block;width:100%}.progress tr{display:grid;grid-template-columns:28px minmax(0,1fr) 94px;width:100%}.progress th,.progress td{display:block;min-width:0}.progress tr.long-answer-row td:nth-child(2){grid-column:2 / -1}.progress tr.long-answer-row td:last-child{grid-column:2 / -1;width:auto;padding:10px 8px 12px;background:#f8fafc;border-radius:6px;margin-bottom:8px;word-break:normal}.long-answer-row .answer-value{font-family:Consolas,"Microsoft YaHei",monospace;overflow-wrap:anywhere;word-break:normal}.answer-label{font-size:11px;font-family:"Segoe UI","Microsoft YaHei",sans-serif;color:#64748b;margin-bottom:6px}.progress-images{margin-top:6px}.progress-image-state{display:block;font-size:10px;color:#94a3b8;margin:3px 0}.progress-image{display:block;width:100%;max-width:100%;height:auto;max-height:none;margin:4px 0 8px;border:1px solid #e2e8f0;border-radius:5px}.balance-row{display:flex;align-items:center;gap:8px;margin:0 0 8px}.balance-row #balanceStatus{flex:1;font-size:11px;color:#64748b;overflow-wrap:anywhere}.balance-row #balanceStatus[data-state=error]{color:#c05050}.balance-row #balanceStatus[data-state=success]{color:#23866a}#balanceRefresh{font-size:11px;padding:4px 7px;white-space:nowrap}.chat-log{height:clamp(90px,28vh,265px)}.chat-images img{width:48px;height:36px;object-fit:contain}.chat-toolbar{display:flex;gap:5px;flex-wrap:wrap;margin:5px 0}.chat-toolbar button{font-size:11px;padding:4px 6px}#requestStats{font-size:10px;color:#64748b;overflow-wrap:anywhere;margin:5px 0}#panelResize{position:absolute;bottom:0;right:0;width:16px;height:16px;cursor:nwse-resize;touch-action:none;background:linear-gradient(135deg,transparent 45%,#94a3b8 46%,#94a3b8 55%,transparent 56%);border:0;padding:0}#chatStop{color:#b55b60}.hotkey-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}.hotkey-grid input{cursor:pointer;font-size:11px}</style>' +
-            '<section role="dialog" aria-label="DeepSeek 设置" aria-modal="false"><header id="titlebar"><strong>DeepSeek</strong><button id="dismiss" aria-label="关闭面板" title="关闭 (Ctrl+G)">×</button></header><nav class="tabs"><button id="tabAnswer" data-active="true">答题</button><button id="tabChat">对话</button></nav><div class="content"><div id="answerPane" class="pane">' +
-            '<label class="row enable-row"><span>启用 AI</span><input id="enabled" type="checkbox" aria-label="启用 AI"></label><label class="field">API Key<input class="control" id="key" type="password" autocomplete="off" placeholder="输入 Key，留空保留已配置值"></label><p class="note" style="margin:-6px 0 6px">保存在 DLL 同目录 config.json · API 调用可能收费</p>' +
+            '.tabs{display:flex;flex-shrink:0;gap:6px;margin:0 16px 12px;padding:3px;background:#f3f6fa;border-radius:9px}.tabs button{flex:1;border:0;padding:6px;background:transparent}.tabs button[data-active=true]{background:#fff;color:#334155;box-shadow:0 1px 4px #0f172a12}.pane[hidden]{display:none!important}.chat-log{height:265px;overflow:auto;padding:4px 0 8px}.chat-message{max-width:88%;margin:7px 0;padding:8px 10px;border-radius:10px;white-space:pre-wrap;word-break:break-word;background:#f1f5f9;color:#334155}.chat-message.user{margin-left:auto;background:#eef2f6}.chat-message.assistant{margin-right:auto}.chat-images{display:flex;gap:5px;flex-wrap:wrap;margin:4px 0 7px}.chat-images span{font-size:11px;padding:3px 6px;border-radius:12px;background:#eef2f7;color:#64748b}.chat-images button{border:0;background:transparent;padding:0;color:#94a3b8}.chat-compose textarea:focus{outline:none;border-color:#cbd5e1;box-shadow:none}.chat-compose textarea{width:100%;height:64px;resize:none;border:1px solid #e2e8f0;border-radius:8px;padding:8px;color:#334155}.chat-actions{display:flex;justify-content:space-between;margin-top:7px}.chat-actions #chatSend{background:#f8fafc;border-color:#e2e8f0;color:#475569}.chat-actions #chatSend:hover{background:#f1f5f9}.paste-hint{font-size:11px;color:#94a3b8;margin-top:5px}' +
+            '.chat-rich{line-height:1.65;min-width:0;max-width:100%}.chat-message.assistant{max-width:100%}.chat-rich ul,.chat-rich ol{margin:6px 0;padding-left:24px;white-space:normal}.chat-rich h1,.chat-rich h2,.chat-rich h3{font-size:1.1em;margin:8px 0}.chat-rich code{font-family:Consolas,monospace;background:#e2e8f0;border-radius:3px;padding:1px 3px}.chat-code{min-width:0;max-width:100%;margin:8px 0;border:1px solid #dbe3ee;border-radius:6px;overflow:hidden;white-space:normal}.chat-code-toolbar{display:flex;flex-wrap:wrap;gap:6px;justify-content:space-between;align-items:center;padding:4px 8px;background:#e2e8f0;font-size:11px}.chat-code-actions{display:flex;flex-wrap:wrap;gap:5px;margin-left:auto}.chat-code-toolbar button{font-size:11px;padding:2px 6px}.chat-code pre{margin:0;padding:10px;max-width:100%;overflow:auto;white-space:pre;overflow-wrap:normal;word-break:normal;tab-size:4;background:#f8fafc}.chat-code[data-wrap=true] pre{white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word}.chat-code pre code{display:block;padding:0;background:none;white-space:inherit;overflow-wrap:inherit;word-break:inherit}.chat-rich .katex-display{overflow-x:auto;overflow-y:hidden;padding:4px 0}.chat-log{overflow-anchor:none}#chatLatest{display:block;margin:4px auto;font-size:11px;color:#334155}#chatLatest[hidden]{display:none}' +
+            'footer{padding:10px 16px 10px;border-top:1px solid #f1f5f9;flex-shrink:0;color:#94a3b8;font-size:11px}footer .row{margin-bottom:5px}#opacity{appearance:none;-webkit-appearance:none;display:block;width:100%;height:4px;padding:0;margin:6px 0;border:0;border-radius:10px;background:#e7ebf0;cursor:pointer}#opacity::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:11px;height:11px;border:0;border-radius:50%;background:#94a3b8}#files{display:none}.answer-value{max-height:none;white-space:pre-wrap;font-size:14px;line-height:1.65}.progress table,.progress thead,.progress tbody{display:block;width:100%}.progress tr{display:grid;grid-template-columns:28px minmax(0,1fr) 94px;width:100%}.progress th,.progress td{display:block;min-width:0}.progress tr.long-answer-row td:nth-child(2){grid-column:2 / -1}.progress tr.long-answer-row td:last-child{grid-column:2 / -1;width:auto;padding:10px 8px 12px;background:#f8fafc;border-radius:6px;margin-bottom:8px;word-break:normal}.long-answer-row .answer-value{font-family:Consolas,"Microsoft YaHei",monospace;overflow-wrap:anywhere;word-break:normal}.answer-label{font-size:11px;font-family:"Segoe UI","Microsoft YaHei",sans-serif;color:#64748b;margin-bottom:6px}.progress-images{margin-top:6px}.progress-image-state{display:block;font-size:10px;color:#94a3b8;margin:3px 0}.progress-image{display:block;width:100%;max-width:100%;height:auto;max-height:none;margin:4px 0 8px;border:1px solid #e2e8f0;border-radius:5px}.balance-row{display:flex;align-items:center;gap:8px;margin:0 0 8px}.balance-row #balanceStatus{flex:1;font-size:11px;color:#64748b;overflow-wrap:anywhere}.balance-row #balanceStatus[data-state=error]{color:#c05050}.balance-row #balanceStatus[data-state=success]{color:#23866a}#balanceRefresh{font-size:11px;padding:4px 7px;white-space:nowrap}.chat-log{height:clamp(90px,28vh,265px)}.chat-images img{width:48px;height:36px;object-fit:contain}.chat-toolbar{display:flex;gap:5px;flex-wrap:wrap;margin:5px 0}.chat-toolbar button{font-size:11px;padding:4px 6px}#requestStats{font-size:10px;color:#64748b;overflow-wrap:anywhere;margin:5px 0}#panelResize{position:absolute;bottom:0;right:0;width:16px;height:16px;cursor:nwse-resize;touch-action:none;background:linear-gradient(135deg,transparent 45%,#94a3b8 46%,#94a3b8 55%,transparent 56%);border:0;padding:0}#chatStop{color:#b55b60}.hotkey-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}.hotkey-grid input{cursor:pointer;font-size:11px}#settingsPane .enable-row{min-height:24px;margin:0 0 6px;color:#334155;font-weight:500}#settingsPane .note{color:#84909f;margin:0 0 12px;line-height:1.7}#settingsPane .note+.enable-row{border-top:1px solid #f1f5f9;padding-top:14px;margin-top:14px}#settingsPane #universalStatus{color:#64748b}.bank-summary{margin:0 0 6px;color:#475569}.bank-actions{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.bank-actions button{font-size:12px;padding:6px 8px}#bankPath,#bankStatus{overflow-wrap:break-word}#bankStatus[data-state=error]{color:#b55b60}.bank-format{margin-top:12px}.bank-format pre{white-space:pre-wrap;word-break:break-word;padding:8px;background:#f8fafc;font:11px/1.6 Consolas,monospace}.bank-result{padding:10px 0;border-top:1px solid #e2e8f0;white-space:pre-wrap;overflow-wrap:break-word}.bank-result summary{cursor:pointer;color:#334155}.bank-answer{margin-top:8px;padding:8px;background:#f8fafc;border-radius:6px}.bank-result .note{margin:5px 0}</style>' +
+            '<section role="dialog" aria-label="设置面板" aria-modal="false"><header id="titlebar"><span aria-hidden="true"></span><button id="dismiss" aria-label="关闭面板" title="关闭 (Ctrl+G)">×</button></header><nav class="tabs"><button id="tabAnswer" data-active="true">答题</button><button id="tabChat">对话</button><button id="tabBank">题库</button><button id="tabSettings">设置</button></nav><div class="content"><div id="bankPane" class="pane" hidden><p id="bankSummary" class="bank-summary">正在读取默认题库…</p><p id="bankPath" class="note"></p><label class="field">导入格式<select id="bankImportFormat" class="control"><option value="docx" selected>Word 文档（.docx）</option><option value="json">JSON 文件（.json）</option></select></label><div class="bank-actions"><button id="bankImport" disabled>导入 Word 题库</button></div><input id="bankFile" type="file" accept=".docx" hidden><p class="note">题库固定使用 DLL 同目录的 question-bank.db，启动时自动创建和打开。导入支持 Word（.docx）和 JSON，每次最多 8 MiB、10000 道题。重复跳过，冲突保留原题。</p><label class="field">题库答题<select id="bankAnswerMode" class="control"><option value="off">关闭题库答题</option><option value="only">仅本地题库</option><option value="first">题库优先，未命中再用 DeepSeek</option></select></label><button id="bankStart" disabled>开始题库答题</button><p class="note">按题干和选项内容匹配，冲突与不明确的结果跳过。沿用答题页的暂停、间隔与覆盖设置。</p><label class="field">搜索题干<input id="bankQuery" class="control" maxlength="512" placeholder="输入关键词，留空查看最近导入的题目" disabled></label><button id="bankSearch" disabled>查询题库</button><p id="bankStatus" class="note" role="status"></p><details class="bank-format"><summary>导入格式</summary><pre>{"schemaVersion":1,"name":"示例题库","questions":[{"id":"q1","type":"boolean","stem":"Python 的列表可修改。","answer":true,"explanation":"列表是可变类型。"}]}</pre><p class="note">题型：single 单选、multiple 多选、boolean 判断、blank 填空、text 简答。选择题答案填选项 ID 数组；填空题每个空使用可接受答案数组；简答题答案为文字。Word 使用“1.【单选题】题干、A.选项、答案：B、答案解析：…”格式；支持嵌入题图，图片题按题干、选项与图片共同匹配。</p></details><div id="bankResults"></div></div><div id="settingsPane" class="pane" hidden><label class="row enable-row"><span>DeepSeek</span><input id="enabled" class="feature-toggle" type="checkbox" aria-label="启用 DeepSeek"></label><p class="note">自动保存，立即生效。关闭后停止当前 AI 请求，保留 Key 和对话。</p><label class="row enable-row"><span>万能脚本</span><input id="universalEnabled" class="feature-toggle" type="checkbox" aria-label="启用万能脚本"></label><p class="note">自动保存，重启客户端后生效。关闭后不加载万能脚本的面板、题库和页面功能。</p><p id="universalStatus" class="note" role="status"></p><p id="universalVersion" class="note"></p><p class="note">来源：scriptcat.org · 脚本 616</p><p class="note">两个开关关闭后，仍可用 Ctrl+G 打开设置。复制粘贴增强继续可用。</p></div><div id="answerPane" class="pane">' +
+            '<label class="field">API Key<input class="control" id="key" type="password" autocomplete="off" placeholder="输入 Key，留空保留已配置值"></label><p class="note" style="margin:-6px 0 6px">保存在 DLL 同目录 config.json · API 调用可能收费</p>' +
             '<div class="balance-row"><span id="balanceStatus" role="status">API 余额 · 点击刷新查询</span><button id="balanceRefresh" title="只读查询，不生成答案；使用已保存的官方 Key">刷新余额</button></div><div class="actions"><button id="save">保存</button><button id="test" title="独立测试连接，可能产生少量 API 费用；不保存设置或获取题目">测试连接</button></div>' +
             '<div class="answer-controls"><label class="answer-setting"><span>逐题间隔</span><span class="delay-control"><input id="answerDelay" type="number" min="0" max="10" step="0.1" inputmode="decimal" aria-label="逐题间隔秒数"><em>秒</em></span></label><label class="answer-setting"><span>答题控制</span><button id="pause" type="button">暂停 · Ctrl+R</button></label></div>' +
-            '<details id="advanced"><summary>更多设置</summary><label class="field">覆盖策略<select class="control" id="overwritePolicy"><option value="always">总是覆盖</option><option value="empty-only">仅空白时填写</option><option value="ask">已有内容则询问</option></select></label><label class="field">模型<input class="control" id="model" spellcheck="false"></label><label class="field">API 地址<input class="control" id="base" spellcheck="false"></label><label class="field">模式<select class="control" id="mode"><option value="ai-only">仅 DeepSeek</option><option value="ai-first">失败回题库（兼容路径）</option><option value="legacy">原题库</option></select></label>' +
+            '<details id="advanced"><summary>更多设置</summary><label class="field">覆盖策略<select class="control" id="overwritePolicy"><option value="always">总是覆盖</option><option value="empty-only">仅空白时填写</option><option value="ask">已有内容则询问</option></select></label><label class="field">模型<input class="control" id="model" spellcheck="false"></label><label class="field">API 地址<input class="control" id="base" spellcheck="false"></label><label class="field">模式<select class="control" id="mode"><option value="ai-only">仅 DeepSeek</option><option value="ai-first">失败回万能脚本题库（兼容路径）</option><option value="legacy">万能脚本题库</option></select></label>' +
             '<details id="hotkeySettings"><summary>快捷键设置</summary><div class="hotkey-grid"><label class="field">打开/隐藏面板<input class="control" id="hotkeyPanel" data-hotkey="panel" readonly aria-label="面板快捷键"></label><label class="field">选中文字立即发送<input class="control" id="hotkeySelection" data-hotkey="selection" readonly aria-label="选中文字快捷键"></label><label class="field">暂停/继续答题<input class="control" id="hotkeyPause" data-hotkey="pause" readonly aria-label="暂停快捷键"></label><label class="field">框选截图<input class="control" id="hotkeyCapture" data-hotkey="capture" readonly aria-label="截图快捷键"></label></div><p class="note">点击输入框再按组合键：Ctrl/Alt + 字母、数字或 F1–F12，可加 Shift。选中文字快捷键会立即调用 API；禁止重复或占用复制粘贴等编辑键。</p><div class="actions"><button id="hotkeySave">保存快捷键</button><button id="hotkeyReset">恢复默认</button></div></details>' +
             '<div class="secondary-actions"><button id="retryFailed" title="仅手动重试失败题，可能产生 API 费用">仅重试失败题</button><button id="retry" title="清除全部缓存；需要重新开始时再操作">清缓存</button><button id="clear">清除 Key</button></div><p class="note">保存后 Key 会明文写入本机 config.json。启用后严格逐题请求、逐题填入；题目与图片会发送至配置的 API。测试不验证识图准确率。</p></details><p id="status" role="status"></p><div id="progressWrap" class="progress" hidden><div class="progress-title">答题过程</div><table><thead><tr><th>题号</th><th>问题</th><th>答案</th></tr></thead><tbody id="progressBody"></tbody></table></div></div>' +
-            '<div id="chatPane" class="pane" hidden><div id="chatLog" class="chat-log" aria-live="polite"></div><div id="chatImages" class="chat-images" hidden></div><div class="chat-compose"><textarea id="chatInput" placeholder="输入消息；Ctrl+V 可直接粘贴剪贴板图片"></textarea><div class="paste-hint">支持上下文 · 剪贴板图片直接粘贴</div><div class="chat-toolbar"><button id="askSelection" title="Ctrl+D">带入选中文字</button><button id="captureRegion" title="Ctrl+Shift+S">框选截图</button><button id="resetBounds">重置面板</button></div><div id="requestStats" role="status"></div><div class="chat-actions"><button id="chatClear">清空对话</button><button id="chatStop" disabled>停止生成</button><button id="chatSend">发送</button></div></div></div></div>' +
+            '<div id="chatPane" class="pane" hidden><div id="chatLog" class="chat-log" aria-live="polite"></div><button id="chatLatest" type="button" hidden>回到最新消息 ↓</button><div id="chatImages" class="chat-images" hidden></div><div class="chat-compose"><textarea id="chatInput" placeholder="输入消息；Ctrl+V 可直接粘贴剪贴板图片"></textarea><div class="paste-hint">支持上下文 · 剪贴板图片直接粘贴</div><div class="chat-toolbar"><button id="askSelection" title="Ctrl+D">带入选中文字</button><button id="captureRegion" title="Ctrl+Shift+S">框选截图</button><button id="resetBounds">重置面板</button></div><div id="requestStats" role="status"></div><div class="chat-actions"><button id="chatClear">清空对话</button><button id="chatStop" disabled>停止生成</button><button id="chatSend">发送</button></div></div></div></div>' +
             '<footer><div class="row"><span title="Ctrl+滚轮调整；右键20%/50%切换">不透明度 <span id="opacityLabel">50%</span><span id="opacitySaveState" role="status" style="margin-left:5px;font-size:10px"></span></span><span id="panelHotkeyHint">Ctrl+G 隐藏</span></div><div id="pauseHotkeyHint" class="muted">Ctrl+R 暂停 / 继续答题</div><input id="opacity" type="range" aria-label="不透明度" min="10" max="100" step="10" value="50"></footer><button id="panelResize" aria-label="调整面板大小"></button></section>';
         function field(id) { return panel.getElementById(id); }
-        field('enabled').checked = cfg.enabled; field('base').value = cfg.baseUrl; field('model').value = cfg.model; field('mode').value = cfg.mode;
+        var refreshQuestionBank = installQuestionBank(panel);
+        field('enabled').checked = enabled(); field('universalEnabled').checked = cfg.universalScriptEnabled;
+        field('universalVersion').textContent = '万能脚本版本：' + (w.__cefUserScriptMetadata && w.__cefUserScriptMetadata.script && w.__cefUserScriptMetadata.script.version || '未知');
+        function updateUniversalStatus() {
+            field('universalStatus').textContent = cfg.universalScriptEnabled !== universalScriptAtStartup ? '开关已更改，重启客户端后生效；请确认底部显示已保存。' : '本次启动：' + (universalScriptAtStartup ? '允许加载万能脚本' : '万能脚本已关闭');
+        }
+        updateUniversalStatus(); field('base').value = cfg.baseUrl; field('model').value = cfg.model; field('mode').value = cfg.mode;
         field('answerDelay').value = String(cfg.answerDelayMs / 1000);
         field('overwritePolicy').value = cfg.overwritePolicy;
         dialog = { host: host, panel: panel, status: field('status') };
         loadHotkeyFields(); renderHotkeyHints();
         function switchPane(name) {
             var chatPane = name === 'chat';
-            field('answerPane').hidden = name !== 'answer'; field('chatPane').hidden = !chatPane;
+            field('answerPane').hidden = name !== 'answer'; field('chatPane').hidden = !chatPane; field('settingsPane').hidden = name !== 'settings'; field('bankPane').hidden = name !== 'bank';
+            field('tabBank').setAttribute('data-active', String(name === 'bank'));
+            if (name === 'bank') refreshQuestionBank();
+            field('tabSettings').setAttribute('data-active', String(name === 'settings'));
             field('tabAnswer').setAttribute('data-active', String(name === 'answer'));
             field('tabChat').setAttribute('data-active', String(chatPane));
             panel.querySelector('.content').scrollTop = 0;
@@ -1286,6 +1658,13 @@
         }
         field('tabAnswer').onclick = function () { switchPane('answer'); };
         field('tabChat').onclick = function () { switchPane('chat'); };
+        field('tabSettings').onclick = function () { switchPane('settings'); };
+        field('tabBank').onclick = function () { switchPane('bank'); };
+        field('universalEnabled').onchange = function () {
+            var value = field('universalEnabled').checked;
+            configure(Object.assign({}, cfg, { universalScriptEnabled: value }));
+            rememberPreference('universalScriptEnabled', value, true); updateUniversalStatus();
+        };
         field('balanceRefresh').onclick = function () { refreshBalance(true).catch(function () {}); };
         renderBalance();
         field('opacity').oninput = function () { setOpacity(Number(field('opacity').value) / 100); };
@@ -1297,8 +1676,13 @@
         field('opacitySaveState').onkeydown = function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); flushOpacitySave(); } };
         field('enabled').onchange = function () {
             var value = field('enabled').checked;
-            configure(Object.assign({}, cfg, { enabled: value }));
+            var nextMode = value && cfg.mode === 'legacy' ? 'ai-only' : cfg.mode;
+            configure(Object.assign({}, cfg, { enabled: value, mode: nextMode }));
+            field('mode').value = nextMode;
+            if (!value) { stopChat(); if (captureCancel) captureCancel(); }
+            rememberPreference('mode', nextMode, false);
             rememberPreference('enabled', value, true);
+            showStatus(value ? 'DeepSeek 已开启' : 'DeepSeek 已关闭，当前 AI 请求已取消', 'success');
         };
         // Affect only this panel. Ctrl+wheel elsewhere must keep normal browser behavior.
         panel.addEventListener('wheel', function (e) {
@@ -1327,7 +1711,7 @@
             return next;
         }
         async function apply() {
-            var next = await persistConfig(draft()); next.panelOpacity = panelOpacity; next.enabled = cfg.enabled; next.answeringPaused = cfg.answeringPaused; configure(next); field('key').value = '';
+            var next = await persistConfig(draft()); next.panelOpacity = panelOpacity; next.enabled = cfg.enabled; next.universalScriptEnabled = cfg.universalScriptEnabled; next.bankAnswerMode = cfg.bankAnswerMode; next.answeringPaused = cfg.answeringPaused; configure(next); field('key').value = ''; field('enabled').checked = enabled();
             field('key').placeholder = cfg.apiKey ? '已配置，留空保留当前 Key' : '输入 Key，留空保留已配置值';
             showStatus(enabled() && cfg.apiKey ? `已保存 · 每题填入后间隔 ${cfg.answerDelayMs / 1000} 秒` : '已保存到 config.json' + (cfg.apiKey ? '' : ' · 尚未配置 Key'), 'success');
         }
@@ -1376,6 +1760,9 @@
         field('chatInput').addEventListener('keydown', function (e) {
             if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); sendChatMessage(); }
         });
+        field('chatLog').addEventListener('scroll', updateChatLatest);
+        field('chatLatest').onclick = function () { var log = field('chatLog'); log.scrollTop = log.scrollHeight; updateChatLatest(); };
+        if (typeof cefChatMathCss !== 'undefined') { var mathStyle = doc.createElement('style'); mathStyle.textContent = cefChatMathCss; panel.appendChild(mathStyle); }
         field('chatSend').onclick = sendChatMessage;
         field('chatStop').onclick = stopChat;
         field('askSelection').onpointerdown = function (e) { e.preventDefault(); }; field('askSelection').onclick = function () { askSelection(); };
@@ -1388,7 +1775,7 @@
         renderProgress(); renderChat(); renderRequestStats(); updatePauseControl(answeringPaused());
         showStatus(lastStatus.message || (stats.lastCode ? '上次状态：' + stats.lastCode : ''), lastStatus.state);
     }
-    w.__cefDeepSeek = { enabled: enabled, mode: function () { return cfg.mode; }, configure: configure, persistConfig: persistConfig, answer: answer, judgeValue: judgeValue, rememberPause: rememberPause,
+    w.__cefDeepSeek = { enabled: enabled, answeringEnabled: answeringEnabled, cleanQuestionStem: cleanQuestionStem, mode: function () { return cfg.mode; }, configure: configure, persistConfig: persistConfig, answer: answer, judgeValue: judgeValue, rememberPause: rememberPause,
         requestText: requestText, chat: chat, stopChat: stopChat, askSelection: askSelection, captureRegion: captureRegion, testConnection: testConnection, refreshBalance: refreshBalance,
         prepareSelection: prepareSelection, recordHotkey: recordHotkey, handleHotkey: handleHotkey,
         status: safeStatus, openSettings: openSettings, toggleSettings: toggleSettings, hideSettings: hideSettings,

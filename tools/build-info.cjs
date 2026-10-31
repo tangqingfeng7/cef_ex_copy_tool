@@ -19,7 +19,7 @@ function sourceInfo(root = ROOT) {
     const files = ['VERSION', 'CMakeLists.txt', 'vcpkg.json', 'vcpkg-configuration.json',
         'tools/build-info.cjs', 'tools/build-environment.ps1', 'tools/build-dll.ps1', 'scripts/clipboard_fix.js',
         'scripts/userscript_boot.js', 'scripts/diagnostics.js',
-        'scripts/dat.js', 'scripts/gm_shim.js', 'scripts/deepseek.js', 'scripts/deepseek_ai_script.js', 'tools/transpile/build.js',
+        'scripts/question_bank_docx.js', 'userscripts/vendor/fflate-0.8.2.js', 'scripts/dat.js', 'scripts/gm_shim.js', 'scripts/deepseek.js', 'scripts/deepseek_ai_script.js', 'tools/transpile/build.js',
         'tools/transpile/babel.config.json', 'tools/transpile/package-lock.json',
         'tools/resource-codec.ps1'];
     function walk(dir) {

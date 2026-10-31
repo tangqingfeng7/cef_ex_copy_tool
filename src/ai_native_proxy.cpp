@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "ai_native_proxy.h"
 #include "ai_config.h"
+#include "question_bank.h"
 #include "ai_stream_buffer.h"
 #include "hotkeys.h"
 #include "instance_hooks.h"
@@ -95,9 +96,10 @@ bool AllowedExamHost(const std::wstring& host) {
         EndsWithInsensitive(host, L".chaoxing.com") || EndsWithInsensitive(host, L".edu.cn");
 }
 
-enum class ProxyRoute { None, Health, Chat, Config, Balance, Capture, Hotkeys };
+enum class ProxyRoute { None, Health, Chat, Config, Balance, Capture, Hotkeys, QuestionBank };
 
 ProxyRoute RouteForPath(const std::wstring& path) {
+    if (path == L"/__cef_cx_ai_proxy__/question-bank") return ProxyRoute::QuestionBank;
     if (path == kHealthPath) return ProxyRoute::Health;
     if (path == kChatPath) return ProxyRoute::Chat;
     if (path == kHotkeysPath) return ProxyRoute::Hotkeys;
@@ -115,7 +117,7 @@ bool IsProxyRoute(const std::wstring& requestUrl, const std::wstring& initiator,
     if (_wcsicmp(request.host.c_str(), source.host.c_str()) != 0 || request.port != source.port || !AllowedExamHost(source.host)) return false;
     const auto route = RouteForPath(request.path);
     if (route == ProxyRoute::Health || route == ProxyRoute::Balance) return _wcsicmp(method.c_str(), L"GET") == 0;
-    return (route == ProxyRoute::Chat || route == ProxyRoute::Config || route == ProxyRoute::Capture || route == ProxyRoute::Hotkeys) &&
+    return (route == ProxyRoute::Chat || route == ProxyRoute::Config || route == ProxyRoute::Capture || route == ProxyRoute::Hotkeys || route == ProxyRoute::QuestionBank) &&
         _wcsicmp(method.c_str(), L"POST") == 0;
 }
 
@@ -330,6 +332,30 @@ struct ProxyResourceHandler {
         auto* self = Self(api);
         if (!handleRequest) return 0;
         if (self->status == 200 && !self->response.empty()) { *handleRequest = 1; return 1; }
+        if (self->route == ProxyRoute::QuestionBank) {
+            auto body = PostBody(request);
+            if (Header(request, L"X-Cef-Cx-Question-Bank") != L"1" || body.empty() || body.size() > 10u * 1024u * 1024u || !callback) {
+                self->status = 400; *handleRequest = 1; return 1;
+            }
+            *handleRequest = 0;
+            if (callback->base.add_ref) callback->base.add_ref(&callback->base);
+            AddRef(&self->api.base);
+            try {
+                std::thread([self, callback, body = std::move(body)]() {
+                    try {
+                        const auto json = HandleQuestionBankRequest(std::string(body.begin(), body.end()), self->canceled);
+                        self->response.assign(json.begin(), json.end()); self->status = 200;
+                    } catch (...) { self->SetError(ERROR_NOT_ENOUGH_MEMORY); }
+                    if (!self->canceled.load() && callback->cont) callback->cont(callback);
+                    if (callback->base.release) callback->base.release(&callback->base);
+                    Release(&self->api.base);
+                }).detach();
+            } catch (...) {
+                if (callback->base.release) callback->base.release(&callback->base);
+                Release(&self->api.base); self->SetError(ERROR_NOT_ENOUGH_MEMORY); *handleRequest = 1;
+            }
+            return 1;
+        }
         if (self->route == ProxyRoute::Config) {
             auto body = PostBody(request);
             const bool saved = !body.empty() && body.size() <= 65536 &&
@@ -479,7 +505,7 @@ cef_resource_request_handler_t* CEF_CALLBACK HookGetResourceRequestHandler(
         initiator = TakeUserfree(frame->get_url(frame));
     const auto selectedRoute = RouteForPath(ParseUrl(url).path);
     // A trusted subframe must not capture a different top-level page's pixels.
-    const bool captureMainFrame = (selectedRoute != ProxyRoute::Capture && selectedRoute != ProxyRoute::Hotkeys) ||
+    const bool captureMainFrame = (selectedRoute != ProxyRoute::Capture && selectedRoute != ProxyRoute::Hotkeys && selectedRoute != ProxyRoute::QuestionBank) ||
         (frame && frame->is_main && frame->is_main(frame));
     if (captureMainFrame && IsProxyRequest(url, initiator, L"", method, isNavigation != 0, isDownload != 0)) {
         if (disableDefaultHandling) *disableDefaultHandling = 1;

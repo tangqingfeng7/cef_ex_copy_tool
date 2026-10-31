@@ -16,7 +16,7 @@ async function fixture(){
   return route.fulfill({contentType:'text/html;charset=utf-8',body:'<!doctype html><meta charset="utf-8"><p id="selected">明确选中的文字</p><input id="pageInput" value="输入框选中内容"><input type="password" id="password" value="fixture-secret"><iframe id="frame" srcdoc="<p>iframe文本</p>"></iframe>'});
  });
  const shim=decodeResource(readResource(fs.readFileSync(path.join(root,'out/build/x86-integrated/src/Release/winmm.dll')),10,201)).toString('utf8');
- async function load(config){await page.goto('https://mooc1.chaoxing.com/exam-ans/exam/test/hotkeys');await page.evaluate(c=>{window.__CX_AI_CONFIG__=c;window.__cefNativeAiProxy={version:1,configWrite:true,hotkeysWrite:true};},config||{enabled:false,apiKey:'fixture-only',baseUrl:'https://api.fixture.invalid',panelOpacity:1,panelBounds:{left:100,top:40,width:480,height:760}});await page.evaluate(shim);await page.evaluate(()=>__cefDeepSeek.openSettings());await page.waitForFunction(()=>__cefDeepSeek.status().hotkeySync==='ready');}
+ async function load(config){await page.goto('https://mooc1.chaoxing.com/exam-ans/exam/test/hotkeys');await page.evaluate(c=>{window.__CX_AI_CONFIG__=c;window.__cefNativeAiProxy={version:1,configWrite:true,hotkeysWrite:true};},config||{enabled:true,apiKey:'fixture-only',baseUrl:'https://api.fixture.invalid',panelOpacity:1,panelBounds:{left:100,top:40,width:480,height:760}});await page.evaluate(shim);await page.evaluate(()=>__cefDeepSeek.openSettings());await page.waitForFunction(()=>__cefDeepSeek.status().hotkeySync==='ready');}
  await load();const panel=page.locator('#cef-deepseek-settings');
  async function settings(){await panel.locator('#tabAnswer').click();await panel.locator('#advanced').evaluate(el=>el.open=true);await panel.locator('#hotkeySettings').evaluate(el=>el.open=true);}
  async function record(id,keys){await panel.locator('#'+id).click();await panel.locator('#'+id).press(keys);}
@@ -26,7 +26,7 @@ async function fixture(){
 
 test('default Ctrl+D sends once, preserves the draft and ignores empty/password/repeated keys; Ctrl+R pauses without reload',{timeout:30000},async()=>{
  const f=await fixture();try{
-  assert.equal(await f.panel.locator('#titlebar strong').textContent(),'DeepSeek');assert.equal(await f.panel.locator('#titlebar .badge').count(),0);
+  assert.equal(await f.panel.locator('#titlebar > span').textContent(),'');assert.equal(await f.panel.locator('#titlebar .badge').count(),0);
   await f.panel.locator('#tabChat').click();await f.panel.locator('#chatInput').fill('未发送的草稿');
   let release;f.state.hold=new Promise(resolve=>release=resolve);
   await f.select();await f.page.keyboard.press('Control+d');await f.page.waitForFunction(()=>__cefDeepSeek.status().chatRequest.state==='waiting');

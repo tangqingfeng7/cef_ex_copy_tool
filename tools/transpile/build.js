@@ -31,7 +31,7 @@ function build() {
     const source = fs.readFileSync(path.join(ROOT, 'scripts/dat.js'), 'utf8');
     const shim = fs.readFileSync(path.join(ROOT, 'scripts/gm_shim.js'), 'utf8');
     const assetManifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts/assets/manifest.json'), 'utf8'));
-    const inputs = ['scripts/dat.js', 'scripts/gm_shim.js', 'scripts/deepseek.js', 'scripts/deepseek_ai_script.js', 'scripts/assets/manifest.json',
+    const inputs = ['scripts/question_bank_docx.js', 'userscripts/vendor/fflate-0.8.2.js', 'scripts/dat.js', 'scripts/gm_shim.js', 'scripts/deepseek.js', 'scripts/deepseek_ai_script.js', 'scripts/assets/manifest.json',
         'tools/transpile/build.js', 'tools/transpile/babel.config.json', 'tools/transpile/package-lock.json',
         'tools/build-info.cjs', 'tools/resource-codec.ps1'];
     const embedded = {}, assets = {};
@@ -75,11 +75,20 @@ function build() {
         'if(!w.__cefUserScriptMetadata||!w.__cefUserScriptMetadata.build||w.__cefUserScriptMetadata.build.id!==build.id){' +
         'var e=new Error("Embedded script pair mismatch; rebuild DLL");e.code="CEF_SCRIPT_PAIR_MISMATCH";throw e;}})(window);\n';
     writeIfChanged('dat.js', guard + result.code);
+    const katexRoot = path.dirname(require.resolve('katex/package.json'));
+    const katexCode = fs.readFileSync(path.join(katexRoot, 'dist/katex.min.js'), 'utf8');
+    const katexCss = fs.readFileSync(path.join(katexRoot, 'dist/katex.min.css'), 'utf8').replace(/url\((fonts\/[^)]+)\)/g, (_, font) => {
+        const extension = path.extname(font).slice(1);
+        return 'url(data:font/' + extension + ';base64,' + fs.readFileSync(path.join(katexRoot, 'dist', font)).toString('base64') + ')';
+    });
+    const bankZipCode = fs.readFileSync(path.join(ROOT, 'userscripts/vendor/fflate-0.8.2.js'), 'utf8');
+    const bankReaderCode = babel.transformSync(fs.readFileSync(path.join(ROOT, 'scripts/question_bank_docx.js'), 'utf8'), { configFile: path.join(__dirname, 'babel.config.json') }).code;
     writeIfChanged('gm_shim.js', 'window.__cefUserScriptMetadata=' + JSON.stringify(metadata) + ';\n' +
-        'window.__cefEmbeddedResources=' + JSON.stringify(embedded) + ';\n' + shim + '\n' +
+        'window.__cefEmbeddedResources=' + JSON.stringify(embedded) + ';\n' + shim + '\n(function(cefBankZip){\n' + bankReaderCode + '\n})((function(){var module={exports:{}};var exports=module.exports;\n' + bankZipCode + '\n;return module.exports;})());\n' +
+        '(function(cefChatMath,cefChatMathCss){\n' +
         babel.transformSync(fs.readFileSync(path.join(ROOT, 'scripts/deepseek.js'), 'utf8'), {
             configFile: path.join(__dirname, 'babel.config.json'), filename: path.join(ROOT, 'scripts/deepseek.js')
-        }).code + '\n' + babel.transformSync(fs.readFileSync(path.join(ROOT, 'scripts/deepseek_ai_script.js'), 'utf8'), {
+        }).code + '\n})((function(){var module={exports:{}};var exports=module.exports;\n' + katexCode + '\n;return module.exports;})(),' + JSON.stringify(katexCss) + ');\n' + babel.transformSync(fs.readFileSync(path.join(ROOT, 'scripts/deepseek_ai_script.js'), 'utf8'), {
             configFile: path.join(__dirname, 'babel.config.json'), filename: path.join(ROOT, 'scripts/deepseek_ai_script.js')
         }).code);
     for (const name of ['dat', 'gm_shim']) {

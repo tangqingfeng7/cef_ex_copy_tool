@@ -118,7 +118,7 @@ test('AI fills a review-flagged blank answer, sends the question image and keeps
         const page = await browser.newPage(); let requestBody;
         const blankHtml = '<!doctype html><meta charset="utf-8"><div class="questionLi" data-question-id="blank">' +
             '<h3 class="mark_name">填空题：看图依次填写三空 <img src="/blank.png"></h3><input name="type0" type="hidden" value="2">' +
-            '<div class="eidtDiv"><textarea></textarea></div><div class="eidtDiv"><textarea></textarea></div><div class="eidtDiv"><textarea></textarea></div></div>';
+            '<div class="eidtDiv"><textarea></textarea></div><div class="eidtDiv"><textarea></textarea></div><div class="eidtDiv"><textarea></textarea></div><button onclick="window.saved=(window.saved||0)+1">保存</button></div>';
         await page.route('**/*', route => {
             const url = new URL(route.request().url());
             if (url.hostname === 'mooc1.chaoxing.com') {
@@ -141,6 +141,8 @@ test('AI fills a review-flagged blank answer, sends the question image and keeps
         assert.deepEqual(await page.locator('textarea').evaluateAll(nodes => nodes.map(node => node.value)), ['第一空', '第二空', '第三空']);
         assert(requestBody.messages[1].content.some(item => item.type === 'image_url' && item.image_url.url.startsWith('data:image/png;base64,')));
         await page.evaluate(() => __cefDeepSeek.openSettings());
+        await page.waitForFunction(() => document.querySelector('#cef-deepseek-settings').shadowRoot.querySelector('#progressBody tr[data-state=review]'));
+        assert.equal(await page.evaluate(() => window.saved), 1);
         assert.match(await page.locator('#cef-deepseek-settings').evaluate(host => host.shadowRoot.querySelector('#progressBody').textContent), /第一空；第二空；第三空（模型建议核对）/);
         assert.equal(await page.locator('#cef-deepseek-settings').evaluate(host => host.shadowRoot.querySelector('#progressBody tr').dataset.state), 'review');
         assert.equal(await page.evaluate(() => Array.from(document.body.children).some(node => node.style.position === 'fixed' && /多个填空/.test(node.textContent))), false);

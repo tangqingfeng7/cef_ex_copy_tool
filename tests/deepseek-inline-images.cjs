@@ -20,7 +20,7 @@ async function fixture(broken = false) {
             } }] }) });
         }
         if (url.pathname === '/broken.png') return route.fulfill({ status: 404, body: '' });
-        const question = n => `<div class="questionLi" data-question-id="q${n}"><h3 class="mark_name">6.（简答题，5.0分）相同题干</h3><input name="type${n}" type="hidden" value="4"><div class="stem"></div><div class="eidtDiv"><textarea></textarea></div></div>`;
+        const question = n => `<div class="questionLi" data-question-id="q${n}"><h3 class="mark_name">6.（简答题，5.0分）相同题干</h3><input name="type${n}" type="hidden" value="4"><div class="stem"></div><div class="eidtDiv"><textarea></textarea></div><button onclick="window.saved=(window.saved||0)+1">保存</button></div>`;
         return route.fulfill({ contentType: 'text/html;charset=utf-8', body: '<!doctype html><meta charset="utf-8">' + question(1) + (broken ? '' : question(2)) });
     });
     await page.goto('https://mooc1.chaoxing.com/exam-ans/exam/test/inline-images');
@@ -54,7 +54,7 @@ test('question-column previews appear during the request and stay correctly pair
     try {
         const started = f.page.waitForRequest('https://ai.fixture.invalid/**');
         await f.start(); await started;
-        assert.deepEqual(await f.page.locator('#cef-deepseek-settings .tabs button').allTextContents(), ['答题', '对话']);
+        assert.deepEqual(await f.page.locator('#cef-deepseek-settings .tabs button').allTextContents(), ['答题', '对话', '题库', '设置']);
         const rows = f.page.locator('#cef-deepseek-settings #progressBody tr');
         const firstImages = rows.first().locator('td:nth-child(2) img');
         assert.equal(await firstImages.count(), 2, 'actual previews belong below the stem in the question column, before the model responds');

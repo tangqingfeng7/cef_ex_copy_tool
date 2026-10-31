@@ -41,7 +41,7 @@ async function fixture() {
     });
     async function load(config) {
         await page.goto(url);
-        await page.evaluate(c => { window.__CX_AI_CONFIG__ = c; window.__cefNativeAiProxy = { version: 1, configWrite: true, captureRead: true, streamRead: true }; }, config || { apiKey: 'fixture-only', baseUrl: url, enabled: false, panelOpacity: 1 });
+        await page.evaluate(c => { window.__CX_AI_CONFIG__ = c; window.__cefNativeAiProxy = { version: 1, configWrite: true, captureRead: true, streamRead: true }; }, config || { apiKey: 'fixture-only', baseUrl: url, enabled: true, panelOpacity: 1 });
         await page.evaluate(shim()); await page.evaluate(() => __cefDeepSeek.openSettings());
     }
     await load();

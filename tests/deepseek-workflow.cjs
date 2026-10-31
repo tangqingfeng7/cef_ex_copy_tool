@@ -16,7 +16,7 @@ const completion = content => JSON.stringify({ choices: [{ finish_reason: 'stop'
 test('Save persists config through the DLL route; chat keeps context and accepts clipboard images', { timeout: 60000 }, async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     try {
-        const page = await browser.newPage();
+        const page = await browser.newPage(); page.setDefaultTimeout(3000);
         const saved = [], chats = [];
         await page.route('**/*', route => {
             const request = route.request(), url = new URL(request.url());
@@ -47,7 +47,9 @@ test('Save persists config through the DLL route; chat keeps context and accepts
         await host.locator('#answerDelay').fill('1.5');
         await host.locator('#advanced').evaluate(element => element.open = true);
         await host.locator('#overwritePolicy').selectOption('ask');
+        await host.locator('#tabSettings').click();
         await host.locator('#enabled').check();
+        await host.locator('#tabAnswer').click();
         await host.locator('#save').click();
         for (let i = 0; i < 50 && !saved.some(c => c.apiKey === 'fixture-persistent-key'); i++) await page.waitForTimeout(20);
         assert(saved.length >= 1);
@@ -99,11 +101,11 @@ test('Save persists config through the DLL route; chat keeps context and accepts
 test('automatic answering requests and fills strictly one question at a time', { timeout: 60000 }, async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     try {
-        const page = await browser.newPage();
+        const page = await browser.newPage(); page.setDefaultTimeout(3000);
         const snapshots = [], requestTimes = [];
         const html = '<!doctype html><meta charset="utf-8">' + [1, 2, 3].map(index =>
             `<div class="questionLi" data-question-id="q${index}"><h3 class="mark_name">${index}.（简答题）[填空题] Q${index}</h3>` +
-            '<input name="type' + index + '" type="hidden" value="4"><div class="eidtDiv"><textarea></textarea></div></div>').join('');
+            '<input name="type' + index + '" type="hidden" value="4"><div class="eidtDiv"><textarea></textarea></div><button onclick="window.saved=(window.saved||0)+1">保存</button></div>').join('');
         await page.route('**/*', async route => {
             const request = route.request(), url = new URL(request.url());
             if (url.hostname === 'mooc1.chaoxing.com') return route.fulfill({ contentType: 'text/html;charset=utf-8', body: html });
@@ -123,8 +125,9 @@ test('automatic answering requests and fills strictly one question at a time', {
         await page.evaluate(aiScript());
         await page.waitForFunction(() => document.querySelectorAll('textarea')[0].value === '答案1' && !document.querySelectorAll('textarea')[1].value);
         await page.evaluate(() => __cefDeepSeek.openSettings());
-        assert.match(await page.locator('#cef-deepseek-settings').evaluate(host => host.shadowRoot.querySelector('#status').textContent), /秒后处理第 2\/3 题/);
+        await page.waitForFunction(() => /秒后处理第 2\/3 题/.test(document.querySelector('#cef-deepseek-settings').shadowRoot.querySelector('#status').textContent));
         await page.waitForFunction(() => Array.from(document.querySelectorAll('textarea')).every(node => node.value));
+        await page.waitForFunction(() => /逐题处理完成/.test(document.querySelector('#cef-deepseek-settings').shadowRoot.querySelector('#status').textContent));
         assert.deepEqual(snapshots, [['', '', ''], ['答案1', '', ''], ['答案1', '答案2', '']], 'next request starts only after the previous field was filled');
         assert(requestTimes[1] - requestTimes[0] >= 900 && requestTimes[2] - requestTimes[1] >= 900, 'configured interval is applied after each fill and before the next request');
         assert.deepEqual(await page.locator('div.questionLi textarea').evaluateAll(nodes => nodes.map(node => node.value)), ['答案1', '答案2', '答案3']);
@@ -136,7 +139,7 @@ test('automatic answering requests and fills strictly one question at a time', {
 test('existing rich-editor text is backed up, cleared and replaced; pause button and Ctrl+R resume safely', { timeout: 30000 }, async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     try {
-        const page = await browser.newPage(); let requests = 0, requestedAt = 0;
+        const page = await browser.newPage(); page.setDefaultTimeout(3000); let requests = 0, requestedAt = 0;
         const html = '<!doctype html><meta charset="utf-8"><div class="questionLi" data-question-id="existing">' +
             '<h3 class="mark_name">2.（简答题）[填空题] len(\'Hello world!\') 的值为()</h3>' +
             '<input name="type0" type="hidden" value="4"><div class="eidtDiv">' +
@@ -171,6 +174,8 @@ test('existing rich-editor text is backed up, cleared and replaced; pause button
         assert(Date.now() - requestedAt < 500, 'the final answer is filled immediately because no next-question interval is needed');
         assert.match(await host.locator('#pause').textContent(), /暂停答题/);
         assert.match(await page.locator('textarea[name=answerEditor2]').inputValue(), /12/);
+        await page.waitForFunction(() => window.saved === 1);
+        await page.waitForFunction(() => !document.querySelector('#cef-deepseek-settings').shadowRoot.querySelector('#progressBody tr[data-state=pending]'));
         assert.equal(await page.evaluate(() => window.saved), 1);
         assert.match(await host.evaluate(element => element.shadowRoot.querySelector('#progressBody').textContent), /已替换原内容/);
     } finally { await browser.close(); }
@@ -184,7 +189,7 @@ test('overwrite policy preserves existing text or asks before replacement', { ti
         '<iframe id="editor" srcdoc="<!doctype html><body>旧答案</body>"></iframe></div>' +
         '<button id="save_1" onclick="window.saved=(window.saved||0)+1"></button></div>';
     async function run(policy, confirmValue) {
-        const page = await browser.newPage(); let requests = 0;
+        const page = await browser.newPage(); page.setDefaultTimeout(3000); let requests = 0;
         await page.route('**/*', route => {
             const url = new URL(route.request().url());
             if (url.hostname === 'mooc1.chaoxing.com') return route.fulfill({ contentType: 'text/html;charset=utf-8', body: html });
@@ -203,7 +208,8 @@ test('overwrite policy preserves existing text or asks before replacement', { ti
         await page.evaluate(aiScript());
         await page.evaluate(selected => __cefDeepSeek.configure({ enabled: true, apiKey: 'fixture', baseUrl: 'https://ai.fixture.invalid', answerDelayMs: 0, overwritePolicy: selected }), policy);
         await page.waitForFunction(() => window.aiAnswersData && Object.keys(window.aiAnswersData).length > 0);
-        await page.waitForTimeout(50);
+        await page.evaluate(() => __cefDeepSeek.openSettings());
+        await page.waitForFunction(() => !document.querySelector('#cef-deepseek-settings').shadowRoot.querySelector('#progressBody tr[data-state=pending]'));
         const result = await page.evaluate(() => ({
             text: document.querySelector('#editor').contentDocument.body.textContent.trim(),
             saved: window.saved || 0,

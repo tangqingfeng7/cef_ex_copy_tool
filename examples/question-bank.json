@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "name": "Python 基础示例",
+  "questions": [
+    {
+      "id": "python-001",
+      "type": "single",
+      "stem": "以下哪个是 Python 的列表？",
+      "options": [
+        {
+          "id": "opt_1",
+          "text": "(1, 2)"
+        },
+        {
+          "id": "opt_2",
+          "text": "[1, 2]"
+        }
+      ],
+      "answer": [
+        "opt_2"
+      ],
+      "explanation": "列表使用方括号。",
+      "tags": [
+        "基础",
+        "数据类型"
+      ]
+    },
+    {
+      "id": "python-002",
+      "type": "multiple",
+      "stem": "哪些是 Python 的可变容器？",
+      "options": [
+        {
+          "id": "list",
+          "text": "列表 list"
+        },
+        {
+          "id": "tuple",
+          "text": "元组 tuple"
+        },
+        {
+          "id": "dict",
+          "text": "字典 dict"
+        }
+      ],
+      "answer": [
+        "list",
+        "dict"
+      ],
+      "explanation": "列表与字典可变，元组不可变。"
+    },
+    {
+      "id": "python-003",
+      "type": "boolean",
+      "stem": "Python 的列表可以修改。",
+      "answer": true,
+      "explanation": "列表是可变类型。"
+    },
+    {
+      "id": "python-004",
+      "type": "blank",
+      "stem": "Python 中输出内容用 ____，获取列表长度用 ____。",
+      "answer": [
+        [
+          "print",
+          "print()"
+        ],
+        [
+          "len",
+          "len()"
+        ]
+      ]
+    },
+    {
+      "id": "python-005",
+      "type": "text",
+      "stem": "写一个返回两个数之和的 Python 函数。",
+      "answer": "def add(a, b):\n    return a + b",
+      "explanation": "保留代码缩进和换行。"
+    }
+  ]
+}

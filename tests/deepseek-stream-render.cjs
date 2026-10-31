@@ -25,7 +25,7 @@ async function fixture() {
     const url = 'http://127.0.0.1:' + server.address().port;
     await page.goto(url);
     await page.evaluate(url => {
-        window.__CX_AI_CONFIG__ = { enabled: false, apiKey: 'fixture-only', baseUrl: url, panelOpacity: 1 };
+        window.__CX_AI_CONFIG__ = { enabled: true, apiKey: 'fixture-only', baseUrl: url, panelOpacity: 1 };
         // Deterministically suspend only the render scheduler. Network/request
         // timeouts and Playwright's explicit 10ms polling retain real timers.
         const timeout = window.setTimeout.bind(window), clear = window.clearTimeout.bind(window);
@@ -77,10 +77,10 @@ test('burst deltas coalesce, reuse history/text/attachment nodes and avoid repea
         const before = await f.page.evaluate(() => { const p = document.querySelector('#cef-deepseek-settings').shadowRoot; return { frames: __renderClock.frames.size, timers: __renderClock.timers.size, text: p.querySelector('#chatLog').lastChild.textContent, sameHistory: __historyNodes.every((n, i) => p.querySelector('#chatLog').children[i] === n && n.firstChild === __historyText[i]), sameImage: p.querySelector('#chatImages img') === __draftImage, draft: p.querySelector('#chatInput').value }; });
         assert.deepEqual(before, { frames: 1, timers: 1, text: '等待回复…', sameHistory: true, sameImage: true, draft: '保留的草稿' });
         await f.page.evaluate(() => __renderClock.flush('frame'));
-        assert.equal(await f.panel.locator('#chatLog > .assistant').last().textContent(), chunk.repeat(200));
+        assert.equal((await f.panel.locator('#chatLog > .assistant').last().innerText()).trimEnd(), chunk.repeat(200).trimEnd());
         assert.equal(await f.panel.locator('#chatLog b').count(), 0, 'stream stays plain text');
         f.emit(['最后一段'], 'done'); await f.idle();
-        assert.equal(await f.panel.locator('#chatLog > .assistant').last().textContent(), chunk.repeat(200) + '最后一段');
+        assert.equal((await f.panel.locator('#chatLog > .assistant').last().innerText()).trimEnd(), chunk.repeat(200) + '最后一段');
         assert.equal(f.state.requests.length, 2); assert.equal(f.state.requests[1].messages.at(-1).content, '仅发送选中文字');
         const after = await f.page.evaluate(() => { const p = document.querySelector('#cef-deepseek-settings').shadowRoot; return { sameHistory: __historyNodes.every((n, i) => p.querySelector('#chatLog').children[i] === n && n.firstChild === __historyText[i]), sameImage: p.querySelector('#chatImages img') === __draftImage, pending: __renderClock.frames.size + __renderClock.timers.size, writes: __statWrites, usage: __cefDeepSeek.status().usage }; });
         assert(after.sameHistory && after.sameImage); assert.equal(after.pending, 0); assert(after.writes < 25, 'state writes must not scale with delta count: ' + after.writes); assert.equal(after.usage.total, 23);

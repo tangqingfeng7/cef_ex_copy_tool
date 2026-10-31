@@ -17,6 +17,7 @@
 #include "frame_documents.h"
 #include "ai_config.h"
 #include "ai_native_proxy.h"
+#include "question_bank.h"
 #include "hotkeys.h"
 #include <bcrypt.h>
 
@@ -517,7 +518,7 @@ static void InjectCrackShim(struct _cef_frame_t* frame) {
     std::wstring script = L"window.__cefBuildInfo=" + std::wstring(kBuildRecord + kBuildRecordPrefix) +
         L";window.__cefRuntimeInfo=" + RuntimeVersionJson() +
         L";window.__cefNativeInfo=" + NativeDiagnosticsJson() +
-        L";window.__cefNativeAiProxy=Object.freeze({version:1,deepseekOnly:true,configWrite:true,balanceRead:true,captureRead:true,streamRead:true,hotkeysWrite:true});\n";
+        L";window.__cefNativeAiProxy=Object.freeze({version:1,deepseekOnly:true,configWrite:true,balanceRead:true,captureRead:true,streamRead:true,hotkeysWrite:true,questionBank:true});\n";
 #if !ENABLE_USERSCRIPT
     script += L"window.__cefUserScriptState={status:'disabled',reason:'build-option'};\n";
 #else
@@ -734,6 +735,9 @@ DWORD WINAPI ThreadProc(LPVOID lpThreadParameter)
     }
     OutputDebugString(TEXT("[CefHook] Hook Success"));
     InterlockedExchange(&g_lifecycleState, LifecycleRunning);
+
+    // Browser process only; do not perform filesystem or SQLite work in DllMain.
+    if (!wcsstr(GetCommandLineW(), L"--type=")) InitializeQuestionBank();
 
 #if ENABLE_UNBLOCK_SWITCH
     DWORD wait = WaitForSingleObject(g_stopEvent, 8000);

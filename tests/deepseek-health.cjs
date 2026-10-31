@@ -26,7 +26,9 @@ test('connection button accepts valid completion without answer schema, saving o
         assert.equal(await host.locator('#base').isVisible(), false);
         assert.equal(await host.locator('h2').count(), 0, 'no redundant title');
         await host.locator('#key').fill('fixture-only-not-a-real-key');
+        await host.locator('#tabSettings').click();
         await host.locator('#enabled').check();
+        await host.locator('#tabAnswer').click();
         await host.locator('#test').click();
         await page.waitForFunction(() => document.querySelector('#cef-deepseek-settings').shadowRoot.querySelector('#status').textContent.includes('连接正常'));
         assert.equal(requests.length, 1);
@@ -57,7 +59,7 @@ test('connection button accepts valid completion without answer schema, saving o
 test('probe distinguishes auth/rate-limit/format/network errors and never retries or enables AI', { timeout: 25000 }, async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     try {
-        const page = await browser.newPage(); await page.setContent('<!doctype html>'); await page.evaluate(shim);
+        const page = await browser.newPage(); page.setDefaultTimeout(3000); await page.setContent('<!doctype html>'); await page.evaluate(shim);
         let mode = '401', count = 0;
         await page.route('https://api.fixture.invalid/**', route => {
             count++;
@@ -78,7 +80,7 @@ test('probe distinguishes auth/rate-limit/format/network errors and never retrie
 test('real answer validation remains strict after separating the health probe', { timeout: 20000 }, async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     try {
-        const page = await browser.newPage(); await page.setContent('<!doctype html>'); await page.evaluate(shim);
+        const page = await browser.newPage(); page.setDefaultTimeout(3000); await page.setContent('<!doctype html>'); await page.evaluate(shim);
         await page.route('https://api.fixture.invalid/**', route => route.fulfill({ contentType: 'application/json', body: completion(incompatibleAnswer) }));
         const code = await page.evaluate(async () => {
             __cefDeepSeek.configure({ enabled: true, apiKey: 'fixture', baseUrl: 'https://api.fixture.invalid' });
@@ -91,7 +93,7 @@ test('real answer validation remains strict after separating the health probe', 
 test('official DeepSeek uses the DLL same-origin proxy when page CSP blocks direct connect', { timeout: 20000 }, async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     try {
-        const page = await browser.newPage(); let health = 0, proxied = 0, direct = 0;
+        const page = await browser.newPage(); page.setDefaultTimeout(3000); let health = 0, proxied = 0, direct = 0;
         await page.route('**/*', route => {
             const request = route.request(), url = new URL(request.url());
             if (url.hostname === 'mooc1.chaoxing.com') {

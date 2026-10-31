@@ -29,11 +29,11 @@ test('built DLL embeds the current native sources, version and Git revision', ()
 test('source fingerprint notices edits with unchanged timestamps and added/deleted headers', t => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cef-fingerprint-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    for (const dir of ['src', 'cef', 'chromium', 'tools/transpile', 'scripts']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    for (const dir of ['src', 'cef', 'chromium', 'tools/transpile', 'scripts', 'userscripts/vendor']) fs.mkdirSync(path.join(root, dir), { recursive: true });
     for (const file of ['CMakeLists.txt', 'vcpkg.json', 'vcpkg-configuration.json',
         'tools/build-info.cjs', 'tools/build-environment.ps1', 'tools/build-dll.ps1', 'scripts/clipboard_fix.js',
         'scripts/userscript_boot.js', 'scripts/diagnostics.js', 'src/main.cpp',
-        'scripts/dat.js', 'scripts/gm_shim.js', 'scripts/deepseek.js', 'scripts/deepseek_ai_script.js', 'tools/transpile/build.js',
+        'scripts/question_bank_docx.js', 'userscripts/vendor/fflate-0.8.2.js', 'scripts/dat.js', 'scripts/gm_shim.js', 'scripts/deepseek.js', 'scripts/deepseek_ai_script.js', 'tools/transpile/build.js',
         'tools/transpile/babel.config.json', 'tools/transpile/package-lock.json', 'tools/resource-codec.ps1'])
         fs.writeFileSync(path.join(root, file), 'first');
     fs.writeFileSync(path.join(root, 'VERSION'), '1.0.0\n');

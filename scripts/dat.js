@@ -6131,7 +6131,7 @@ var GLOBAL = {
         }
     }
     function reportOnline() {
-        if (window.__cefDeepSeek && window.__cefDeepSeek.enabled() && window.__cefDeepSeek.mode() === "ai-only") return;
+        if (window.__cefDeepSeek && window.__cefDeepSeek.answeringEnabled() && (window.__cefDeepSeek.status().bankAnswerEnabled || window.__cefDeepSeek.mode() === "ai-only")) return;
         probeHosts();
         GM_xmlhttpRequest({
             method: "POST",
@@ -6604,10 +6604,10 @@ var GLOBAL = {
         if (window.__cxUpstreamAI && window.__cxUpstreamAI.active()) return { success: false, msg: "上游 AI 已接管：鼠标中键填充，Ctrl+C 获取答案" };
         delete initData.__cefAI;
         delete initData.__cefAIValidate;
-        if (window.__cefDeepSeek && window.__cefDeepSeek.enabled()) {
+        if (window.__cefDeepSeek && window.__cefDeepSeek.answeringEnabled()) {
             try { return await window.__cefDeepSeek.answer(initData); }
             catch (error) {
-                if (window.__cefDeepSeek.mode() === "ai-only" || error.code === "STALE" || error.code === "CANCELED")
+                if ((window.__cefDeepSeek.status().bankAnswerEnabled || window.__cefDeepSeek.mode() === "ai-only") || error.code === "STALE" || error.code === "CANCELED")
                     return { success: false, msg: error.message };
             }
         }
@@ -7143,7 +7143,7 @@ var GLOBAL = {
                     });
                     const formatResult = await formatSearchAnswer(data);
                     if (window.__cxUpstreamAI && window.__cxUpstreamAI.active()) return;
-                    const hookAnswer = !(window.__cefDeepSeek && window.__cefDeepSeek.enabled()) && data.answer && data.answer.length > 0 && GM_getValue("start_pay");
+                    const hookAnswer = !(window.__cefDeepSeek && window.__cefDeepSeek.answeringEnabled()) && data.answer && data.answer.length > 0 && GM_getValue("start_pay");
                     const formatAns = hookAnswer ? {
                         success: true,
                         num: formatResult.num,

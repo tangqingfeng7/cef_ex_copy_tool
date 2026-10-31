@@ -18,5 +18,7 @@
   },
   "answeringPaused": false,
   "maxImages": 6,
-  "imageMaxEdge": 2048
+  "imageMaxEdge": 2048,
+  "universalScriptEnabled": true,
+  "bankAnswerMode": "off"
 }

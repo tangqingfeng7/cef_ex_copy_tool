@@ -12,12 +12,20 @@ find_library(DETOURS_LIBRARY NAMES detours
     HINTS ${_detours_roots} PATH_SUFFIXES lib REQUIRED)
 
 file(GLOB SOURCES CONFIGURE_DEPENDS "*.cpp" "*.c")
+list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/question_bank.cpp")
+add_library(question_bank STATIC question_bank.cpp vendor/sqlite/sqlite3.c)
+target_compile_definitions(question_bank PRIVATE SQLITE_THREADSAFE=1 SQLITE_OMIT_LOAD_EXTENSION SQLITE_DQS=0)
+target_link_libraries(question_bank PUBLIC Shell32 Cabinet Bcrypt)
+if(MSVC)
+    target_compile_options(question_bank PRIVATE /utf-8 /EHsc)
+endif()
 add_library(CefHook SHARED ${SOURCES} version.rc)
 find_program(NODE_EXECUTABLE NAMES node REQUIRED)
 file(GLOB _script_assets CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/scripts/assets/*")
 add_custom_command(OUTPUT "${CMAKE_SOURCE_DIR}/out/js/build.stamp"
     COMMAND "${NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/transpile/build.js"
     DEPENDS "${CMAKE_SOURCE_DIR}/scripts/dat.js" "${CMAKE_SOURCE_DIR}/scripts/gm_shim.js"
+        "${CMAKE_SOURCE_DIR}/scripts/question_bank_docx.js" "${CMAKE_SOURCE_DIR}/userscripts/vendor/fflate-0.8.2.js"
         "${CMAKE_SOURCE_DIR}/scripts/deepseek.js"
         "${CMAKE_SOURCE_DIR}/scripts/deepseek_ai_script.js"
         "${CMAKE_SOURCE_DIR}/tools/transpile/build.js" "${CMAKE_SOURCE_DIR}/tools/transpile/babel.config.json"
@@ -53,7 +61,7 @@ set_target_properties(CefHook PROPERTIES
     PREFIX ""
 )
 target_include_directories(CefHook PRIVATE ${DETOURS_INCLUDE_DIRS})
-target_link_libraries(CefHook PRIVATE ${DETOURS_LIBRARY} Dbghelp Shell32 Cabinet Bcrypt Winhttp Gdi32 User32)
+target_link_libraries(CefHook PRIVATE question_bank ${DETOURS_LIBRARY} Dbghelp Shell32 Cabinet Bcrypt Winhttp Gdi32 User32)
 
 target_include_directories(CefHook PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 if(MSVC)
@@ -66,7 +74,7 @@ if(BUILD_TESTING)
     target_sources(native_callbacks PRIVATE "${_userscript_resources}")
     add_dependencies(native_callbacks build_info)
     target_include_directories(native_callbacks PRIVATE ${DETOURS_INCLUDE_DIRS} "${CMAKE_CURRENT_BINARY_DIR}/generated")
-    target_link_libraries(native_callbacks PRIVATE ${DETOURS_LIBRARY} Shlwapi Dbghelp Shell32 Cabinet Bcrypt Winhttp Gdi32 User32)
+    target_link_libraries(native_callbacks PRIVATE question_bank ${DETOURS_LIBRARY} Shlwapi Dbghelp Shell32 Cabinet Bcrypt Winhttp Gdi32 User32)
     target_compile_options(native_callbacks PRIVATE /utf-8 /EHsc)
     add_test(NAME native_callbacks COMMAND native_callbacks)
     add_executable(script_cache "${CMAKE_SOURCE_DIR}/tests/script_cache.cpp")
@@ -89,6 +97,6 @@ endif()
 if(BUILD_TESTING)
     add_executable(native_proxy_transport "${CMAKE_SOURCE_DIR}/tests/native_proxy_transport.cpp")
     target_compile_options(native_proxy_transport PRIVATE /utf-8 /EHsc)
-    target_link_libraries(native_proxy_transport PRIVATE Winhttp Cabinet Bcrypt Gdi32 User32)
+    target_link_libraries(native_proxy_transport PRIVATE question_bank Winhttp Cabinet Bcrypt Gdi32 User32)
     add_test(NAME native_proxy_transport COMMAND native_proxy_transport)
 endif()

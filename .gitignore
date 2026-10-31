@@ -13,3 +13,6 @@
 
 # Runtime AI credentials (never commit)
 /config.json
+
+# Local VS Code configuration
+/.vscode/

@@ -44,6 +44,13 @@
     w.__cefRunUserScript = function (run) {
         if (state.status === 'loading' || state.status === 'ready') return state.promise;
         if (blockingFailure()) return Promise.resolve();
+        if (w.__cefDeepSeek && w.__cefDeepSeek.status().universalScriptAtStartup === false) {
+            cancelTimer(); revision++;
+            state.status = 'disabled'; state.phase = 'boot'; state.reason = 'user-disabled';
+            state.displayName = '万能脚本'; state.error = null; state.failedFile = null;
+            return Promise.resolve();
+        }
+        state.displayName = '万能脚本';
         cancelTimer();
         var ownRevision = ++revision;
         state.status = 'loading'; state.phase = 'boot';

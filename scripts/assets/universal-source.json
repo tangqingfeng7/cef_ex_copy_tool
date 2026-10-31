@@ -1,0 +1,9 @@
+{
+  "name": "万能答题脚本",
+  "source": "https://scriptcat.org/zh-CN/script-show-page/616",
+  "version": "5.4.2",
+  "checkedOn": "2026-10-31",
+  "upstreamSha256": "63ed0dccc2ad274a3b380eca838392deb3a4cb13da9393234a554c1962eec407",
+  "localSource": "scripts/dat.js",
+  "note": "Official latest install endpoint checked; local source retains host jQuery isolation, AI integration, safe fill and panel compatibility patches."
+}
