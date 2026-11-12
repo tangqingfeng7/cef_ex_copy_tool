@@ -6607,10 +6607,14 @@ var GLOBAL = {
         if (window.__cefDeepSeek && window.__cefDeepSeek.answeringEnabled()) {
             try { return await window.__cefDeepSeek.answer(initData); }
             catch (error) {
-                if ((window.__cefDeepSeek.status().bankAnswerEnabled || window.__cefDeepSeek.mode() === "ai-only") || error.code === "STALE" || error.code === "CANCELED")
+                if (window.__cefDeepSeek.status().bankAnswerEnabled || window.__cefDeepSeek.mode() === "ai-only" ||
+                    ["STALE", "STALE_CANVAS", "STALE_EDIT", "CANCELED"].includes(error.code))
                     return { success: false, msg: error.message };
             }
         }
+        return searchLegacyAnswers(initData);
+    }
+    async function searchLegacyAnswers(initData) {
         const data = {
             plat: initData.plat ? parseInt(initData.plat) : null,
             qid: initData.qid ? String(initData.qid) : null,
@@ -6747,21 +6751,10 @@ var GLOBAL = {
 	 *
 	 * @param list 获取的答案列表
 	 * @param data 发送请求的data
-	 * @param handler 执行的函数
-	 * @param ignore_click
-	 */    async function defaultQuestionResolve(list, data, handler, ignore_click) {
-        if (data.__cefAI && (!data.__cefAIValidate || !data.__cefAIValidate()))
-            return { style: "error-row", ans: "题目已变化，未填充旧答案", question: data.question };
-        let targetOptionsList = [];
-        if (data.__cefAI) {
-            if ([2, 4, 5, 6, 7, 8].includes(data.type)) return fillBlank(list[0], data, handler);
-            const indices = data.type === 3 ? [Number(isTrue(list[0][0]) ? isFalse(data.options[0]) : isTrue(data.options[0]))] : list[0].map(x => x.charCodeAt(0) - 65);
-            targetOptionsList.push(new Set(indices));
-        }
-        for (const answers of data.__cefAI ? [] : list) {
-            if (data.type === 2 || data.type === 4 || data.type === 5 || data.type === 6 || data.type === 7 || data.type === 8) {
-                return fillBlank(answers, data, handler);
-            } else if (data.type === 3) {
+	 */    function legacyOptionIndices(list, data) {
+        const targetOptionsList = [];
+        for (const answers of list) {
+            if (data.type === 3) {
                 if (targetOptionsList.length > 3) break;
                 let targetOptions = new Set;
                 if (isTrue(answers.join())) {
@@ -6814,6 +6807,43 @@ var GLOBAL = {
                 items = getLang(sortArr.filter(i => i.length > 0));
             }
         }
+        return items;
+    }
+    if (window.__cxUpstreamAI) window.__cefLegacyQuestionLookup = async function (data) {
+        function pageText(node) {
+            const copy = node.cloneNode(true);
+            copy.querySelectorAll(".mark_letter,.answerBg,.mark_answer,.aiAssistant").forEach(label => label.remove());
+            return formatString(filterImg(copy));
+        }
+        const question = legacyQuestionText(pageText(data.stemNode));
+        if (!question) return null;
+        const options = data.optionNodes ? Array.from(data.optionNodes, option =>
+            pageText(option.querySelector(".answer_p") || option.querySelector("div.clearfix") || option)) : data.options;
+        const result = await searchLegacyAnswers({ question, options, type: data.type });
+        if (!result.success) return null;
+        const type = data.type === 2 ? "blank" : data.type === 4 ? "text" : data.type === 3 ? "judge" :
+            data.type === 1 ? "multiple" : "single";
+        if (type === "text" || type === "blank") {
+            const answers = result.answers || (result.list || [])[0];
+            return answers && { type, answers, needsReview: false };
+        }
+        const indices = result.answers || legacyOptionIndices(result.list || [], { type: data.type, options });
+        if (!Array.isArray(indices) || !indices.length || indices.some(index => !Number.isInteger(index) || index < 0 || index >= data.options.length))
+            return null;
+        if (type === "judge") {
+            if (indices.length !== 1) return null;
+            const value = window.__cefDeepSeek.judgeValue(data.options[indices[0]]);
+            return value == null ? null : { type, answers: [value ? "正确" : "错误"], needsReview: false };
+        }
+        return { type, choices: indices.map(index => String.fromCharCode(65 + index)), needsReview: false };
+    };
+    async function defaultQuestionResolve(list, data, handler, ignore_click) {
+        if (data.__cefAI && (!data.__cefAIValidate || !data.__cefAIValidate()))
+            return { style: "error-row", ans: "题目已变化，未填充旧答案", question: data.question };
+        if ([2, 4, 5, 6, 7, 8].includes(data.type) && list.length) return fillBlank(list[0], data, handler);
+        const items = data.__cefAI
+            ? data.type === 3 ? [Number(isTrue(list[0][0]) ? isFalse(data.options[0]) : isTrue(data.options[0]))] : list[0].map(x => x.charCodeAt(0) - 65)
+            : legacyOptionIndices(list, data);
         if (items && items.length > 0) {
             for (let index = 0; index < data.$options.length; index++) {
                 const $item = data.$options.eq(index);
@@ -7027,6 +7057,10 @@ var GLOBAL = {
         }, 10);
         return elem;
     }
+    function legacyQuestionText(text) {
+        return text.replace(/^\d+、/, "").replace(/[(（](\d+\s?(\.\d+)?分)[)）]$/, "")
+            .replace(/^((\d+.(\s+)?)?)[\[(（【](.*?)[】)）\]]/, "").trim();
+    }
     const init$1 = async ($TiMu, select, wrap) => {
         let question = formatString(filterImg($TiMu.find(select.elements.question)));
         if (select.elements.type && select.elements.type.includes("input[name^=type]:eq")) {
@@ -7035,7 +7069,7 @@ var GLOBAL = {
         let data = {
             $item: $TiMu,
             question_text: $TiMu.find(select.elements.question).text(),
-            question: question.length === 0 ? $TiMu.find(select.elements.question) : question.replace(/^\d+、/, "").replace(/[(（](\d+\s?(\.\d+)?分)[)）]$/, "").replace(/^((\d+.(\s+)?)?)[\[(（【](.*?)[】)）\]]/, "").trim(),
+            question: question.length === 0 ? $TiMu.find(select.elements.question) : legacyQuestionText(question),
             $options: select.elements.$options ? $TiMu.find(select.elements.$options) : undefined,
             options: select.elements.options ? jQuery.map($TiMu.find(select.elements.options), function(val) {
                 return formatString(filterImg(val)).replace(/^[A-Ga-g][.、]/, "").trim();

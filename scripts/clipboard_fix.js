@@ -18,18 +18,37 @@
             var prevent = proto.preventDefault;
             var stop = proto.stopPropagation;
             var stopImmediate = proto.stopImmediatePropagation;
-            function editable(e) {
-                var el = e.target;
+            function eventTarget(e) {
+                return e.composedPath()[0] || e.target;
+            }
+            function editable(el) {
                 if (!el || el.disabled || el.readOnly) return null;
                 if (el.tagName === 'TEXTAREA') return el;
-                if (el.tagName === 'INPUT' && /^(text|search|url|tel|password)$/.test(el.type)) return el;
+                if (el.tagName === 'INPUT' && /^(text|search|url|tel|password|email)$/.test(el.type)) return el;
                 if (el.isContentEditable) return el;
                 return null;
             }
-            function shortcut(e) {
+            function pasteShortcut(e) {
                 return ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey &&
                     (e.keyCode === 86 || String(e.key).toLowerCase() === 'v')) ||
                     (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.keyCode === 45);
+            }
+            function clipboardShortcut(e, el) {
+                if (pasteShortcut(e)) return !!editable(el);
+                if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return false;
+                var key = String(e.key).toLowerCase();
+                if (e.keyCode === 88 || key === 'x') return !!editable(el);
+                if (e.keyCode !== 67 && key !== 'c') return false;
+                var selection = w.getSelection();
+                return !!editable(el) || !!(el && el.selectionStart < el.selectionEnd) || !!(selection && !selection.isCollapsed);
+            }
+            function panelEvent(e) {
+                return e.target && e.target.id === 'cef-deepseek-settings';
+            }
+            function panelHandler(e) {
+                var target = e.currentTarget;
+                var root = target && target.getRootNode && target.getRootNode();
+                return root && root.host && root.host.id === 'cef-deepseek-settings';
             }
             var controls = 'label,button,select,option,a[href],[role="button"],[role="checkbox"],input[type="checkbox"],input[type="radio"],input[type="button"],input[type="submit"],input[type="reset"]';
             var optionContainers = ['.questionLi .answerBg', '.TiMu .answerBg'];
@@ -44,10 +63,10 @@
             }
             function protectedEvent(e) {
                 // Labels/buttons should keep their normal selection behavior.
-                if (e.type === 'selectstart' && controlTarget(e) && !editable(e) && !selectableOption(e)) return false;
-                return /^(copy|selectstart|contextmenu|beforecopy)$/.test(e.type) ||
-                    (editable(e) && (/^(paste|cut|beforepaste|beforecut)$/.test(e.type) ||
-                    (/^key(down|press|up)$/.test(e.type) && shortcut(e))));
+                if (e.type === 'selectstart' && controlTarget(e) && !editable(eventTarget(e)) && !selectableOption(e)) return false;
+                return (/^(copy|selectstart|contextmenu|beforecopy)$/.test(e.type) ||
+                    (/^(paste|cut|beforepaste|beforecut)$/.test(e.type) && editable(eventTarget(e))) ||
+                    (/^key(down|press|up)$/.test(e.type) && clipboardShortcut(e, eventTarget(e)))) && !panelHandler(e);
             }
             // Applies to earlier listeners without wrapping addEventListener,
             // so removeEventListener and listener identity retain native behavior.
@@ -64,17 +83,17 @@
             };
             ['copy', 'cut', 'selectstart', 'contextmenu', 'beforecopy', 'beforecut', 'beforepaste'].forEach(function (type) {
                 listen(w, type, function (e) {
-                    if (protectedEvent(e)) stopImmediate.call(e);
+                    if (!panelEvent(e) && protectedEvent(e)) stopImmediate.call(e);
                 });
             });
             ['keydown', 'keypress', 'keyup'].forEach(function (type) {
                 listen(w, type, function (e) {
-                    if (editable(e) && shortcut(e)) stopImmediate.call(e);
+                    if (!panelEvent(e) && pasteShortcut(e) && editable(eventTarget(e))) stopImmediate.call(e);
                 });
             });
             listen(w, 'paste', function (e) {
-                var el = editable(e);
-                if (!e.isTrusted) return;
+                if (!e.isTrusted || panelEvent(e)) return;
+                var el = editable(eventTarget(e));
                 if (!el || !e.clipboardData) {
                     console.warn('[CefHook] paste skipped', e.target && e.target.nodeName,
                         'readonly=', !!(e.target && e.target.readOnly), 'disabled=', !!(e.target && e.target.disabled));
@@ -85,6 +104,7 @@
                 var text = e.clipboardData.getData('text/plain');
                 if (!text) return;
                 stopImmediate.call(e);
+                if (el.tagName === 'INPUT' && el.type === 'email') return; // Leave insertion to the browser.
                 var inserted = false;
                 try { inserted = d.execCommand('insertText', false, text); } catch (_) {}
                 if (!inserted && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {

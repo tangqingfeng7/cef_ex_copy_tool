@@ -5,6 +5,7 @@
 #include "ai_stream_buffer.h"
 #include "hotkeys.h"
 #include "instance_hooks.h"
+#include "vendor/nlohmann/json.hpp"
 
 #include <winhttp.h>
 #include <atomic>
@@ -18,6 +19,28 @@
 #include "include/capi/cef_callback_capi.h"
 #include "include/capi/cef_resource_handler_capi.h"
 #include "include/capi/cef_resource_request_handler_capi.h"
+
+bool MergeAiConfigFile(const std::wstring& path, const std::string& changes) {
+    using Json = nlohmann::json;
+    try {
+        const auto patch = Json::parse(changes, nullptr, false);
+        if (!patch.is_object()) { SetLastError(ERROR_INVALID_DATA); return false; }
+        static std::mutex configMutex;
+        std::lock_guard<std::mutex> lock(configMutex);
+        std::string bytes;
+        Json config;
+        if (ReadAiConfigBytes(path, bytes)) config = Json::parse(bytes, nullptr, false);
+        else if (GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+        if (!config.is_object()) config = Json{{"enabled", false}};
+        if ((!config.contains("enabled") || config["enabled"].is_null()) && patch.contains("apiKey") && !patch.contains("enabled")) {
+            const auto key = config.find("apiKey");
+            config["enabled"] = key != config.end() && key->is_string() &&
+                key->get_ref<const std::string&>().find_first_not_of(" \t\r\n") != std::string::npos;
+        }
+        config.update(patch);
+        return WriteAiConfigFile(path, config.dump());
+    } catch (...) { SetLastError(ERROR_INVALID_DATA); return false; }
+}
 
 namespace {
 
@@ -359,7 +382,7 @@ struct ProxyResourceHandler {
         if (self->route == ProxyRoute::Config) {
             auto body = PostBody(request);
             const bool saved = !body.empty() && body.size() <= 65536 &&
-                SaveAiConfigFile(std::string(body.begin(), body.end()));
+                MergeAiConfigFile(AiConfigPath(), std::string(body.begin(), body.end()));
             self->status = saved ? 200 : 500;
             const DWORD error = saved ? ERROR_SUCCESS : body.empty() || body.size() > 65536 ? ERROR_INVALID_DATA : GetLastError();
             const std::string json = saved ? "{\"saved\":true}" : "{\"saved\":false,\"win32\":" + std::to_string(error) + "}";

@@ -223,6 +223,15 @@ int main() {
         CHECK(savedPrelude.find(L"JSON.parse") != std::wstring::npos);
         CHECK(savedPrelude.find(L"fixture-persisted") == std::wstring::npos);
         CHECK(!WriteAiConfigFile(tempFile, "not-json"));
+        CHECK(MergeAiConfigFile(tempFile, "{\"apiKey\":\"fixture-new\"}"));
+        CHECK(MergeAiConfigFile(tempFile, "{\"hotkeys\":{\"selection\":\"Ctrl+Alt+K\"}}"));
+        std::string merged;
+        CHECK(ReadAiConfigBytes(tempFile, merged));
+        CHECK(merged == "{\"apiKey\":\"fixture-new\",\"enabled\":true,\"hotkeys\":{\"selection\":\"Ctrl+Alt+K\"}}");
+        CHECK(!MergeAiConfigFile(tempFile, "[]"));
+        CHECK(WriteAiConfigFile(tempFile, "{}"));
+        CHECK(MergeAiConfigFile(tempFile, "{\"apiKey\":\"fixture-new\"}"));
+        CHECK(ReadAiConfigBytes(tempFile, merged) && merged == "{\"apiKey\":\"fixture-new\",\"enabled\":false}");
         DeleteFileW(tempFile);
         CHECK(shim.find(L"__cefDeepSeek") != std::wstring::npos);
         CHECK(IsAllowedAiProxyRouteForTest(

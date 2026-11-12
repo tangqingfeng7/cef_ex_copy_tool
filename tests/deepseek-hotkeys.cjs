@@ -8,15 +8,16 @@ const root=path.resolve(__dirname,'..');
 async function fixture(){
  const browser=await chromium.launch({channel:'msedge',headless:true});
  const page=await browser.newPage({viewport:{width:1100,height:900}}),state={disk:null,wires:[],requests:[],hold:null,syncFail:false};const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ const initial={enabled:true,apiKey:'fixture-only',baseUrl:'https://api.fixture.invalid',panelOpacity:1,panelBounds:{left:100,top:40,width:480,height:760}};
  await page.route('**/*',async route=>{const req=route.request(),url=new URL(req.url());
   if(url.pathname==='/__cef_cx_ai_proxy__/hotkeys'){state.wires.push(req.postData());return route.fulfill({status:state.syncFail?500:200,contentType:'application/json',body:JSON.stringify({updated:!state.syncFail})});}
   if(url.pathname==='/__cef_cx_ai_proxy__/health')return route.fulfill({contentType:'application/json',body:'{"cefCxAiProxy":1}'});
-  if(url.pathname==='/__cef_cx_ai_proxy__/config'){state.disk=JSON.parse(req.postData());return route.fulfill({contentType:'application/json',body:'{"saved":true}'});}
+  if(url.pathname==='/__cef_cx_ai_proxy__/config'){state.disk={...(state.disk||initial),...JSON.parse(req.postData())};return route.fulfill({contentType:'application/json',body:'{"saved":true}'});}
   if(url.hostname==='api.fixture.invalid'){state.requests.push(JSON.parse(req.postData()));const hold=state.hold;state.hold=null;if(hold)await hold;return route.fulfill({contentType:'application/json',body:JSON.stringify({choices:[{finish_reason:'stop',message:{content:'本地对话回复'}}],usage:{prompt_tokens:2,completion_tokens:3,total_tokens:5}})});}
   return route.fulfill({contentType:'text/html;charset=utf-8',body:'<!doctype html><meta charset="utf-8"><p id="selected">明确选中的文字</p><input id="pageInput" value="输入框选中内容"><input type="password" id="password" value="fixture-secret"><iframe id="frame" srcdoc="<p>iframe文本</p>"></iframe>'});
  });
  const shim=decodeResource(readResource(fs.readFileSync(path.join(root,'out/build/x86-integrated/src/Release/winmm.dll')),10,201)).toString('utf8');
- async function load(config){await page.goto('https://mooc1.chaoxing.com/exam-ans/exam/test/hotkeys');await page.evaluate(c=>{window.__CX_AI_CONFIG__=c;window.__cefNativeAiProxy={version:1,configWrite:true,hotkeysWrite:true};},config||{enabled:true,apiKey:'fixture-only',baseUrl:'https://api.fixture.invalid',panelOpacity:1,panelBounds:{left:100,top:40,width:480,height:760}});await page.evaluate(shim);await page.evaluate(()=>__cefDeepSeek.openSettings());await page.waitForFunction(()=>__cefDeepSeek.status().hotkeySync==='ready');}
+ async function load(config){await page.goto('https://mooc1.chaoxing.com/exam-ans/exam/test/hotkeys');await page.evaluate(c=>{window.__CX_AI_CONFIG__=c;window.__cefNativeAiProxy={version:1,configWrite:true,hotkeysWrite:true};},config||initial);await page.evaluate(shim);await page.evaluate(()=>__cefDeepSeek.openSettings());await page.waitForFunction(()=>__cefDeepSeek.status().hotkeySync==='ready');}
  await load();const panel=page.locator('#cef-deepseek-settings');
  async function settings(){await panel.locator('#tabAnswer').click();await panel.locator('#advanced').evaluate(el=>el.open=true);await panel.locator('#hotkeySettings').evaluate(el=>el.open=true);}
  async function record(id,keys){await panel.locator('#'+id).click();await panel.locator('#'+id).press(keys);}

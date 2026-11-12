@@ -4,6 +4,18 @@
     var W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
     var A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
     var R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+    var M = 'http://schemas.openxmlformats.org/officeDocument/2006/math';
+    var types = { '单选题': 'single', '选择题': 'single', '多选题': 'multiple', '判断题': 'boolean', '填空题': 'blank', '简答题': 'text', '问答题': 'text', '论述题': 'text', '编程题': 'text', '程序设计题': 'text' };
+    var typeHeading = new RegExp('^\\s*(?:(?:第\\s*)?\\d+\\s*[.、．:：]\\s*)?[（(【\\[]\\s*(?:' + Object.keys(types).join('|') + ')(?:\\s*[,，]\\s*\\d+(?:[.．]\\d+)?\\s*分)?\\s*[）)】\\]]\\s*');
+    var sectionHeading = /^\s*【\s*(?:背景(?:资料|材料)?|(?:案例|情境)(?:背景|资料|材料)?|(?:阅读)?材料|题干)\s*[:：]?\s*】\s*[:：]?\s*/;
+    function stripStemHeadings(value) {
+        var text = value.trim();
+        for (;;) {
+            var rest = text.replace(typeHeading, '').replace(sectionHeading, '');
+            if (rest === text) return text;
+            text = rest;
+        }
+    }
     function xml(bytes) {
         var text = cefBankZip.strFromU8(bytes);
         if (/<!DOCTYPE|<!ENTITY/i.test(text)) throw new Error('Word 文件包含不支持的 XML 实体');
@@ -11,7 +23,8 @@
         if (result.getElementsByTagName('parsererror').length) throw new Error('Word 文档 XML 损坏');
         return result;
     }
-    w.__cefParseBankDocx = function (bytes, filename) {
+    w.__cefParseBankDocx = function (bytes, filename, options) {
+        var preview = !!(options && options.preview), errors = [], locations = [];
         var selectedBytes = 0;
         var files = cefBankZip.unzipSync(bytes, { filter: function (entry) {
             var selected = entry.name === 'word/document.xml' || entry.name === 'word/_rels/document.xml.rels' || /^word\/media\/[^/]+$/.test(entry.name);
@@ -30,8 +43,8 @@
                 if (/^media\/[^/]+$/.test(target)) relationships[rel.getAttribute('Id')] = 'word/' + target;
             });
         }
-        var warnings = [], paragraphs = [], currentImages = [];
-        function image(id) {
+        var warnings = [], paragraphs = [], references = [];
+        function image(id, question) {
             var path = relationships[id], data = path && files[path];
             if (!data) throw new Error('文档中有无法读取的图片，请嵌入图片后重新保存 Word');
             if (!media[path]) {
@@ -43,32 +56,51 @@
                 for (var i = 0; i < data.length; i += 8192) chunks.push(String.fromCharCode.apply(null, data.subarray(i, i + 8192)));
                 media[path] = { id: 'img' + (++imageIndex), dataUrl: 'data:image/' + mime + ';base64,' + btoa(chunks.join('')) };
             }
-            if (!currentImages.some(function (item) { return item.id === media[path].id; })) currentImages.push(media[path]);
+            if (!question.images.some(function (item) { return item.id === media[path].id; })) question.images.push(media[path]);
             return '[图片:' + media[path].id + ']';
+        }
+        function reference(id) {
+            // XML text cannot contain NUL. Resolve references only in lines assigned to a question.
+            return '\0' + (references.push(id) - 1) + '\0';
+        }
+        function questionText(text, question, paragraph) {
+            try {
+                return text.replace(/\0(\d+)\0/g, function (_, index) {
+                    var id = references[index];
+                    if (id === false) throw new Error('Word 原生公式请转为 PNG/JPEG 并嵌入后重新导入');
+                    return image(id, question);
+                });
+            } catch (error) {
+                var message = 'Word 第 ' + paragraph + ' 段：' + error.message;
+                if (!preview) throw new Error(message);
+                question.parseError = question.parseError || message;
+                return '';
+            }
         }
         function read(node) {
             if (node.nodeType !== 1) return '';
             if (node.namespaceURI === W && node.localName === 't') return node.textContent;
             if (node.namespaceURI === W && (node.localName === 'br' || node.localName === 'cr')) return '\n';
             if (node.namespaceURI === W && node.localName === 'tab') return '\t';
-            if (node.namespaceURI === A && node.localName === 'blip') return image(node.getAttributeNS(R, 'embed'));
-            if (node.localName === 'imagedata') return image(node.getAttributeNS(R, 'id'));
+            if (node.namespaceURI === A && node.localName === 'blip') return reference(node.getAttributeNS(R, 'embed'));
+            if (node.localName === 'imagedata') return reference(node.getAttributeNS(R, 'id'));
             if (node.namespaceURI === W && node.localName === 'del') return '';
+            if (node.namespaceURI === M && (node.localName === 'oMath' || node.localName === 'oMathPara')) return reference(false);
             return Array.prototype.map.call(node.childNodes, read).join('');
         }
         var body = documentXml.getElementsByTagNameNS(W, 'body')[0];
         if (!body) throw new Error('Word 文档没有正文');
-        Array.prototype.forEach.call(body.getElementsByTagNameNS(W, 'p'), function (p) {
-            currentImages = [];
-            var value = read(p).replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n').trim();
-            if (value) paragraphs.push({ text: value, images: currentImages.slice() });
+        Array.prototype.forEach.call(body.getElementsByTagNameNS(W, 'p'), function (p, paragraphIndex) {
+            var value = read(p).replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n');
+            paragraphs.push({ text: value, number: paragraphIndex + 1 });
         });
         var questions = [], q = null, field = 'stem';
-        var types = { '单选题': 'single', '选择题': 'single', '多选题': 'multiple', '判断题': 'boolean', '填空题': 'blank', '简答题': 'text', '问答题': 'text', '论述题': 'text', '编程题': 'text' };
         function append(value) { q[field] = (q[field] ? q[field] + '\n' : '') + value; }
         function finish() {
             if (!q) return;
             var prefix = '第 ' + q.number + ' 题：';
+            try {
+            if (q.parseError) throw new Error(prefix + q.parseError);
             if (!q.stem.trim()) throw new Error(prefix + '题干为空');
             if (!q.rawAnswer.trim()) throw new Error(prefix + '缺少“答案：”');
             if (q.type === 'single' || q.type === 'multiple') {
@@ -83,43 +115,70 @@
                 else throw new Error(prefix + '判断题答案无法识别');
                 q.options = [];
             } else if (q.type === 'blank') {
-                var numbered = /[（(]\s*\d+\s*[）)]\s*/g, matches = Array.from(q.rawAnswer.matchAll(numbered)), parts;
+                var numbered = /(^|[；;\s]+)[（(]\s*(\d+)\s*[）)]/g, candidates = Array.from(q.rawAnswer.matchAll(numbered)), matches = [], parts;
+                if (candidates.length && candidates[0].index === 0 && Number(candidates[0][2]) === 1) {
+                    matches.push(candidates[0]);
+                    var labels = new Map();
+                    candidates.slice(1).forEach(function (match) {
+                        var number = Number(match[2]), previous = labels.get(number);
+                        if (!previous || /[；;\r\n]/.test(match[1]) && !/[；;\r\n]/.test(previous[1])) labels.set(number, match);
+                    });
+                    for (var number = 2, label; (label = labels.get(number)) && label.index > matches[matches.length - 1].index; number++) {
+                        matches.push(label);
+                    }
+                }
                 if (matches.length) parts = matches.map(function (match, i) { return q.rawAnswer.slice(match.index + match[0].length, i + 1 < matches.length ? matches[i + 1].index : undefined).replace(/[；;\s]+$/, '').trim(); });
                 else parts = q.rawAnswer.split(/[；;]/).map(function (part) { return part.trim(); });
                 if (parts.some(function (part) { return !part; })) throw new Error(prefix + '填空答案为空');
                 q.answer = parts.map(function (part) { return [part]; });
                 var blanks = (q.stem.match(/_{2,}/g) || []).length;
                 if (blanks && blanks !== parts.length) warnings.push(prefix + blanks + ' 个空但答案为 ' + parts.length + ' 组，保留原答案供核对，自动答题将跳过空数不符的题');
-            } else q.answer = q.rawAnswer;
-            delete q.number; delete q.rawAnswer; questions.push(q); q = null;
+            } else q.answer = q.rawAnswer.replace(/\n[\s]*$/, '');
+            } catch (error) {
+                if (!preview) throw error;
+                errors.push({ index: questions.length + 1, error: error.message }); q.answer = null;
+            }
+            locations.push({ number: q.number, paragraph: q.paragraph });
+            delete q.number; delete q.paragraph; delete q.parseError; delete q.rawAnswer; questions.push(q); q = null;
         }
         paragraphs.forEach(function (paragraph) {
             var lines = paragraph.text.split('\n');
             lines.forEach(function (line) {
-                var heading = /^\s*(\d+)\s*[.、．]\s*【([^】]+)】\s*(.*)$/.exec(line);
+                var text = line.trim(), preserveIndent = q && q.type === 'text' && field === 'rawAnswer';
+                if (!text && !preserveIndent) return;
+                var heading = /^(\d+)\s*[.、．]\s*【([^】]+)】\s*(.*)$/.exec(text);
                 if (heading) {
                     finish();
-                    if (!types[heading[2]]) throw new Error('第 ' + heading[1] + ' 题：不支持题型 ' + heading[2]);
-                    q = { number: heading[1], type: types[heading[2]], stem: heading[3].replace(/^(?:【[^】]+】\s*)+/, ''), options: [], rawAnswer: '', explanation: '', tags: [], images: [] };
+                    if (!types[heading[2]] && !preview) throw new Error('第 ' + heading[1] + ' 题：不支持题型 ' + heading[2]);
+                    q = { number: heading[1], paragraph: paragraph.number, type: types[heading[2]] || heading[2], stem: '', options: [], rawAnswer: '', explanation: '', tags: [], images: [] };
+                    q.stem = stripStemHeadings(questionText(heading[3], q, paragraph.number));
+                    if (!types[heading[2]]) q.parseError = '不支持题型 ' + heading[2];
                     field = 'stem';
                 } else if (!q) return;
-                else if (/^\s*(?:答案解析|解析)\s*[:：]/.test(line)) { field = 'explanation'; append(line.replace(/^\s*(?:答案解析|解析)\s*[:：]\s*/, '')); }
-                else if (/^\s*(?:正确答案|参考答案|答案)\s*[:：]/.test(line)) { field = 'rawAnswer'; append(line.replace(/^\s*(?:正确答案|参考答案|答案)\s*[:：]\s*/, '')); }
-                else if (/^\s*(?:难易程度|难易度|难度|课程目标|标签|知识点)\s*[:：]/.test(line)) { field = 'ignored'; }
-                else {
-                    var option = /^\s*([A-Z])[.、．]\s*(.*)$/.exec(line);
-                    if (option && field !== 'rawAnswer' && field !== 'explanation' && ['single', 'multiple', 'boolean'].indexOf(q.type) >= 0) {
-                        if (q.options.some(function (o) { return o.id === option[1]; })) throw new Error('第 ' + q.number + ' 题：选项编号重复');
-                        q.options.push({ id: option[1], text: option[2] }); field = 'option';
-                    } else if (field === 'option') q.options[q.options.length - 1].text += '\n' + line;
-                    else if (field !== 'ignored') append(line);
+                else if (/^(?:答案解析|解析)\s*[:：]/.test(text)) { field = 'explanation'; append(questionText(text.replace(/^(?:答案解析|解析)\s*[:：]\s*/, ''), q, paragraph.number)); }
+                else if (/^(?:正确答案|参考答案|答案)\s*[:：]/.test(text)) {
+                    field = 'rawAnswer';
+                    var answer = line.replace(/^\s*(?:正确答案|参考答案|答案)\s*[:：]/, '');
+                    append(questionText(q.type === 'text' ? answer.replace(/^ (?=\S)/, '') : answer.trim(), q, paragraph.number));
                 }
-                if (q) paragraph.images.forEach(function (image) { if (!q.images.some(function (existing) { return existing.id === image.id; })) q.images.push(image); });
+                else if (/^(?:难易程度|难易度|难度|课程目标|标签|知识点)\s*[:：]/.test(text)) { field = 'ignored'; }
+                else {
+                    var option = /^([A-Z])[.、．]\s*(.*)$/.exec(text);
+                    if (option && field !== 'rawAnswer' && field !== 'explanation' && ['single', 'multiple', 'boolean'].indexOf(q.type) >= 0) {
+                        if (q.options.some(function (o) { return o.id === option[1]; })) {
+                            if (!preview) throw new Error('第 ' + q.number + ' 题：选项编号重复');
+                            q.parseError = '选项编号重复';
+                        }
+                        q.options.push({ id: option[1], text: questionText(option[2], q, paragraph.number) }); field = 'option';
+                    } else if (field === 'option') q.options[q.options.length - 1].text += '\n' + questionText(text, q, paragraph.number);
+                    else if (field !== 'ignored') append(questionText(preserveIndent ? line : text, q, paragraph.number));
+                }
             });
         });
         finish();
         if (!questions.length) throw new Error('未找到“1.【单选题】题干”格式的题目');
         questions.forEach(function (item) { delete item.ignored; if (!item.images.length) delete item.images; });
-        return { payload: { schemaVersion: 1, name: filename.replace(/\.docx$/i, ''), questions: questions }, warnings: warnings };
+        return { payload: { schemaVersion: 1, name: filename.replace(/\.docx$/i, ''), questions: questions }, warnings: warnings, errors: errors, locations: locations };
     };
+    w.__cefParseBankDocx.stripStemHeadings = stripStemHeadings;
 })(window);

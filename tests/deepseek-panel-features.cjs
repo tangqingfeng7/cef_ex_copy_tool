@@ -29,19 +29,20 @@ async function fixture() {
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const url = 'http://127.0.0.1:' + server.address().port;
+    const initial = { apiKey: 'fixture-only', baseUrl: url, enabled: true, panelOpacity: 1 };
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     const page = await browser.newPage({ viewport: { width: 1000, height: 900 } });
     const errors = []; page.on('pageerror', e => errors.push(e.message));
     await page.route('**/__cef_cx_ai_proxy__/**', async route => {
         const req = route.request();
         if (req.url().endsWith('/health')) return route.fulfill({ contentType: 'application/json', body: '{"cefCxAiProxy":1}' });
-        if (req.url().endsWith('/config')) { state.config = JSON.parse(req.postData()); return route.fulfill({ contentType: 'application/json', body: '{"saved":true}' }); }
+        if (req.url().endsWith('/config')) { state.config = { ...(state.config || initial), ...JSON.parse(req.postData()) }; return route.fulfill({ contentType: 'application/json', body: '{"saved":true}' }); }
         if (req.url().endsWith('/capture')) { state.hiddenAtCapture = await page.evaluate(() => document.querySelector('#cef-deepseek-settings').style.visibility === 'hidden'); return route.fulfill({ contentType: 'image/bmp', body: state.capture }); }
         return route.abort();
     });
     async function load(config) {
         await page.goto(url);
-        await page.evaluate(c => { window.__CX_AI_CONFIG__ = c; window.__cefNativeAiProxy = { version: 1, configWrite: true, captureRead: true, streamRead: true }; }, config || { apiKey: 'fixture-only', baseUrl: url, enabled: true, panelOpacity: 1 });
+        await page.evaluate(c => { window.__CX_AI_CONFIG__ = c; window.__cefNativeAiProxy = { version: 1, configWrite: true, captureRead: true, streamRead: true }; }, config || initial);
         await page.evaluate(shim()); await page.evaluate(() => __cefDeepSeek.openSettings());
     }
     await load();
@@ -121,6 +122,19 @@ test('region capture crops actual pixels, cancels cleanly and retains only remov
         bmp.writeUInt32LE(40, 14); bmp.writeInt32LE(1000, 18); bmp.writeInt32LE(-900, 22); bmp.writeUInt16LE(1, 26); bmp.writeUInt16LE(32, 28);
         for (let y = 0; y < 900; y++) for (let x = 0; x < 1000; x++) bmp[54 + (y * 1000 + x) * 4 + (x < 500 ? 2 : 0)] = 255;
         f.state.capture = bmp;
+        await f.panel.locator('#advanced > summary').click();
+        await f.panel.locator('#key').fill('unsaved-fixture-key');
+        await f.panel.locator('#base').fill('https://fixture.invalid/v1');
+        await f.panel.locator('#model').fill('draft-model');
+        await f.panel.locator('#tabChat').click(); await f.panel.locator('#captureRegion').click();
+        await f.page.locator('#cef-capture-region').waitFor(); await f.page.keyboard.press('Control+g');
+        await f.page.locator('#cef-capture-region').waitFor({ state: 'detached' });
+        await f.panel.waitFor({ state: 'hidden' });
+        await f.page.keyboard.press('Control+g'); await f.panel.waitFor();
+        await f.panel.locator('#tabAnswer').click();
+        assert.equal(await f.panel.locator('#key').inputValue(), '', 'an unsaved Key never stays in the hidden panel');
+        assert.equal(await f.panel.locator('#base').inputValue(), 'https://fixture.invalid/v1');
+        assert.equal(await f.panel.locator('#model').inputValue(), 'draft-model');
         await f.panel.locator('#tabChat').click(); await f.panel.locator('#captureRegion').click();
         await f.page.locator('#cef-capture-region').waitFor(); await f.page.keyboard.press('Escape');
         await f.page.locator('#cef-capture-region').waitFor({ state: 'detached' });
@@ -214,6 +228,119 @@ test('queued chat cancellation removes only that job and does not abort the acti
 });
 
 
+test('invalid chat drafts remain editable and do not enter the next request', { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        f.state.mode = 'json';
+        const tooLong = 'x'.repeat(32001);
+        await f.send(tooLong);
+        assert.match(await f.panel.locator('#status').textContent(), /对话内容为空或过长/);
+        assert.equal(await f.panel.locator('#chatInput').inputValue(), tooLong);
+        assert.equal(await f.panel.locator('#chatLog .user').count(), 0);
+        assert.equal(f.state.requests.length, 0);
+        await f.send('缩短后的问题');
+        await f.page.waitForFunction(() => __cefDeepSeek.status().chatRequest.state === 'completed');
+        assert.deepEqual(f.state.requests[0].messages.filter(m => m.role === 'user').map(m => m.content), ['缩短后的问题']);
+    } finally { await f.close(); }
+});
+
+test('large image chat trims the oldest complete turn while keeping the current image and recent messages', { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        f.state.mode = 'json';
+        await f.page.evaluate(async () => {
+            const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1320;
+            const ctx = canvas.getContext('2d'), data = ctx.createImageData(canvas.width, canvas.height), pixels = new Uint32Array(data.data.buffer);
+            let seed = 123456789;
+            for (let i = 0; i < pixels.length; i++) { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; pixels[i] = seed | 0xff000000; }
+            ctx.putImageData(data, 0, 0);
+            window.fixtureImage = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+        });
+        async function sendImage(text) {
+            await f.draft(text);
+            await f.panel.locator('#chatInput').evaluate(input => {
+                const data = new DataTransfer(); data.items.add(new File([fixtureImage], 'large.png', { type: 'image/png' }));
+                input.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: data }));
+            });
+            await f.panel.locator('#chatImages img').waitFor();
+            await f.panel.locator('#chatSend').click();
+            await f.page.waitForFunction(() => __cefDeepSeek.status().chatRequest.state === 'completed');
+        }
+        await sendImage('第一张图');
+        await f.send('保留这段文字'); await f.page.waitForFunction(() => __cefDeepSeek.status().chatRequest.state === 'completed');
+        await sendImage('第二张图');
+        assert.equal(f.state.requests.length, 3);
+        const messages = f.state.requests[2].messages.slice(1);
+        assert.deepEqual(messages.map(message => message.role), ['user', 'assistant', 'user']);
+        assert.equal(messages[0].content, '保留这段文字');
+        assert.equal(messages[2].content[0].text, '第二张图');
+        assert.equal(messages[2].content[1].type, 'image_url');
+        assert.equal(await f.panel.locator('#chatLog .user').count(), 3);
+    } finally { await f.close(); }
+});
+
+test('clearing answer cache leaves streaming chat running and queued cancellation stays out of context', { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        await f.page.evaluate(() => { window.firstChat = __cefDeepSeek.chat([{ role: 'user', content: '占用队列' }]); });
+        await f.page.waitForFunction(() => __cefDeepSeek.status().chatRequest.state === 'streaming');
+        await f.panel.locator('#tabAnswer').click(); await f.panel.locator('#advanced > summary').click(); await f.panel.locator('#retry').click();
+        assert.equal(await f.page.evaluate(() => __cefDeepSeek.status().chatRequest.state), 'streaming');
+        await f.send('取消后不应发送');
+        await f.page.waitForFunction(() => __cefDeepSeek.status().chatRequest.state === 'queued');
+        await f.panel.locator('#chatStop').click();
+        await f.panel.locator('#chatLog').getByText('已取消发送').first().waitFor();
+        assert.equal(f.state.requests.length, 1);
+        f.state.finish(); await f.page.evaluate(() => firstChat);
+        f.state.mode = 'json'; await f.send('正常后续问题');
+        await f.page.waitForFunction(() => __cefDeepSeek.status().chatRequest.state === 'completed');
+        assert.deepEqual(f.state.requests[1].messages.filter(m => m.role === 'user').map(m => m.content), ['正常后续问题']);
+    } finally { await f.close(); }
+});
+
+test('send waits for a pasted image and includes it in the current message', { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        f.state.mode = 'json'; await f.draft('请解释这张图');
+        await f.panel.locator('#chatInput').evaluate(async input => {
+            const canvas = document.createElement('canvas'); canvas.width = canvas.height = 16;
+            const blob = await new Promise(resolve => canvas.toBlob(resolve));
+            const raw = FileReader.prototype.readAsArrayBuffer;
+            FileReader.prototype.readAsArrayBuffer = function (value) {
+                window.finishPasteRead = () => { FileReader.prototype.readAsArrayBuffer = raw; raw.call(this, value); };
+            };
+            const data = new DataTransfer(); data.items.add(new File([blob], 'image.png', { type: 'image/png' }));
+            input.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: data }));
+        });
+        await f.page.waitForFunction(() => typeof finishPasteRead === 'function');
+        await f.panel.locator('#chatSend').click();
+        assert.equal(await f.panel.locator('#chatInput').inputValue(), '请解释这张图');
+        assert.equal(f.state.requests.length, 0);
+        await f.page.evaluate(() => finishPasteRead());
+        await f.page.waitForFunction(() => __cefDeepSeek.status().chatRequest.state === 'completed');
+        const content = f.state.requests[0].messages.at(-1).content;
+        assert.equal(content[0].text, '请解释这张图'); assert.equal(content[1].type, 'image_url');
+        assert.equal(await f.panel.locator('#chatImages img').count(), 0);
+    } finally { await f.close(); }
+});
+
+test('the DeepSeek toggle preserves a mode draft until it is saved', { timeout: 15000 }, async () => {
+    const f = await fixture();
+    try {
+        await f.panel.locator('#advanced > summary').click();
+        await f.panel.locator('#mode').selectOption('ai-first');
+        await f.panel.locator('#tabSettings').click();
+        await f.panel.locator('#enabled').uncheck();
+        await f.panel.locator('#tabAnswer').click();
+        assert.equal(await f.panel.locator('#mode').inputValue(), 'ai-first');
+        assert.equal(await f.page.evaluate(() => __cefDeepSeek.mode()), 'ai-only');
+        await f.panel.locator('#save').click();
+        await f.page.waitForFunction(() => __cefDeepSeek.mode() === 'ai-first');
+        assert.equal(f.state.config.mode, 'ai-first');
+        assert.equal(f.state.config.enabled, false);
+    } finally { await f.close(); }
+});
+
 test('direct send keeps removable image thumbnails, handles image-only/Enter and IME, and uses slim chat scrollbars', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
@@ -233,19 +360,32 @@ test('direct send keeps removable image thumbnails, handles image-only/Enter and
         assert.equal(f.state.requests.length, 1);
         assert.equal(f.state.requests[0].messages.at(-1).content, '回车发送');
         await input.fill('');
+        await f.page.evaluate(baseUrl => __cefDeepSeek.configure({ apiKey: 'fixture-only', enabled: true, baseUrl, maxImages: 8 }), f.url);
         await input.evaluate(async el => {
             const c = document.createElement('canvas'); c.width = c.height = 8; c.getContext('2d').fillRect(0, 0, 8, 8);
             const blob = await new Promise(resolve => c.toBlob(resolve)); const file = new File([blob], 'fixture.png', { type: 'image/png' });
             const event = new Event('paste', { bubbles: true, cancelable: true });
-            Object.defineProperty(event, 'clipboardData', { value: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }], getData: () => '' } }); el.dispatchEvent(event);
+            Object.defineProperty(event, 'clipboardData', { value: { items: Array.from({ length: 8 }, () => ({ kind: 'file', type: 'image/png', getAsFile: () => file })), getData: () => '' } }); el.dispatchEvent(event);
         });
-        await f.page.waitForFunction(() => document.querySelector('#cef-deepseek-settings').shadowRoot.querySelectorAll('#chatImages img').length === 1);
+        await f.page.waitForFunction(() => document.querySelector('#cef-deepseek-settings').shadowRoot.querySelectorAll('#chatImages img').length === 8);
+        await input.evaluate(async el => {
+            const canvas = document.createElement('canvas');
+            const blob = await new Promise(resolve => canvas.toBlob(resolve));
+            const data = new DataTransfer();
+            data.setData('text/plain', '超过图片上限时仍保留这段文字');
+            data.items.add(new File([blob], 'extra.png', { type: 'image/png' }));
+            el.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: data }));
+        });
+        assert.equal(await input.inputValue(), '超过图片上限时仍保留这段文字');
+        assert.equal(await f.panel.locator('#chatImages img').count(), 8);
+        await input.fill('');
         assert.equal(f.state.requests.length, 1);
         await f.panel.locator('#chatSend').evaluate(el => { el.click(); el.click(); });
         await f.page.waitForFunction(() => __cefDeepSeek.status().chatRequest.state === 'completed');
         assert.equal(f.state.requests.length, 2, 'busy guard prevents duplicate sends');
         const content = f.state.requests[1].messages.at(-1).content;
-        assert(content.some(b => b.type === 'image_url')); assert(content.some(b => b.type === 'text' && b.text === '请分析这张图片。'));
+        assert.equal(content.filter(b => b.type === 'image_url').length, 8);
+        assert(content.some(b => b.type === 'text' && b.text === '请分析这张图片。'));
         assert.equal(await f.panel.locator('#chatImages img').count(), 0);
         assert.deepEqual(f.errors, []);
     } finally { await f.close(); }

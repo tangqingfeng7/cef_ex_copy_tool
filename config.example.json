@@ -20,5 +20,6 @@
   "maxImages": 6,
   "imageMaxEdge": 2048,
   "universalScriptEnabled": true,
-  "bankAnswerMode": "off"
+  "bankAnswerMode": "off",
+  "bankScope": ""
 }

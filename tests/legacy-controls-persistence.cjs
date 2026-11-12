@@ -18,7 +18,7 @@ async function fixture(loadDat = false, overrideFetch = false) {
         const p = new URL(route.request().url()).pathname;
         if (p.endsWith('/health')) return route.fulfill({ contentType: 'application/json', body: '{"cefCxAiProxy":1}' });
         if (p.endsWith('/config')) {
-            const next = JSON.parse(route.request().postData()); writes.push(next); if (configStatus === 200) disk = next;
+            const next = JSON.parse(route.request().postData()); writes.push(next); if (configStatus === 200) disk = { ...disk, ...next };
             return route.fulfill({ status: configStatus, contentType: 'application/json', body: JSON.stringify({ saved: configStatus === 200, win32: configStatus === 200 ? 0 : 5 }) });
         }
         if (p.endsWith('/chat/completions')) {

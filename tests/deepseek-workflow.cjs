@@ -23,7 +23,7 @@ test('Save persists config through the DLL route; chat keeps context and accepts
             if (url.hostname === 'mooc1.chaoxing.com') {
                 if (url.pathname === '/__cef_cx_ai_proxy__/health') return route.fulfill({ contentType: 'application/json', body: '{"cefCxAiProxy":1}' });
                 if (url.pathname === '/__cef_cx_ai_proxy__/config') {
-                    saved.push(JSON.parse(request.postData()));
+                    saved.push({ ...saved.at(-1), ...JSON.parse(request.postData()) });
                     return route.fulfill({ contentType: 'application/json', body: '{"saved":true}' });
                 }
                 return route.fulfill({ contentType: 'text/html;charset=utf-8', body: '<!doctype html><meta charset="utf-8"><main>workflow fixture</main>' });

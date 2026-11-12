@@ -6,7 +6,7 @@ const { chromium } = require('../tools/transpile/node_modules/playwright');
 const { readResource } = require('../tools/embedded-resources.cjs');
 const { decodeResource } = require('../tools/resource-codec.cjs');
 const dll = process.env.DEEPSEEK_TEST_DLL || path.resolve(__dirname, '../out/build/x86-integrated/src/Release/winmm.dll');
-async function fixture(broken = false) {
+async function fixture(broken = false, pagePath = '/exam-ans/exam/test/inline-images') {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     const page = await browser.newPage(); const requests = [];
     let release; const gate = new Promise(resolve => { release = resolve; });
@@ -23,7 +23,7 @@ async function fixture(broken = false) {
         const question = n => `<div class="questionLi" data-question-id="q${n}"><h3 class="mark_name">6.（简答题，5.0分）相同题干</h3><input name="type${n}" type="hidden" value="4"><div class="stem"></div><div class="eidtDiv"><textarea></textarea></div><button onclick="window.saved=(window.saved||0)+1">保存</button></div>`;
         return route.fulfill({ contentType: 'text/html;charset=utf-8', body: '<!doctype html><meta charset="utf-8">' + question(1) + (broken ? '' : question(2)) });
     });
-    await page.goto('https://mooc1.chaoxing.com/exam-ans/exam/test/inline-images');
+    await page.goto('https://mooc1.chaoxing.com' + pagePath);
     await page.evaluate(broken => {
         const roots = document.querySelectorAll('.questionLi');
         roots.forEach((root, index) => {
@@ -88,4 +88,33 @@ test('an unreadable question image shows its capture error in the same question 
         assert.equal(await cell.locator('img').count(), 0);
         assert.equal(f.requests.length, 0);
     } finally { f.release(); await f.browser.close(); }
+});
+
+test('a late-loading image is captured on the first attempt and changing its source invalidates the result', { timeout: 15000 }, async () => {
+    const f = await fixture(false, '/fixture/inline-images');
+    let releaseImage;
+    const imageReady = new Promise(resolve => { releaseImage = resolve; });
+    try {
+        await f.page.route('**/slow.png', async route => {
+            await imageReady;
+            await route.fulfill({ contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64') });
+        });
+        await f.start();
+        assert.equal(await f.page.evaluate(() => {
+            const root = document.querySelector('.questionLi'), image = root.querySelector('img');
+            image.src = '/slow.png';
+            window.slowQuestion = { root, question: '图题', type: 4 };
+            window.slowAnswer = __cefDeepSeek.answer(slowQuestion).then(result => result.success, error => error.code);
+            return image.complete;
+        }), false);
+        releaseImage(); f.release();
+        assert.equal(await f.page.evaluate(() => slowAnswer), true);
+        assert.equal(f.requests.length, 1);
+        const valid = await f.page.evaluate(() => {
+            const before = slowQuestion.__cefAIValidate();
+            slowQuestion.root.querySelector('img').src = '/replacement.png';
+            return [before, slowQuestion.__cefAIValidate()];
+        });
+        assert.deepEqual(valid, [true, false]);
+    } finally { releaseImage(); f.release(); await f.browser.close(); }
 });

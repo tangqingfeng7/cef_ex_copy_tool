@@ -10,7 +10,7 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
 const shim = decodeResource(readResource(fs.readFileSync(path.join(root, 'out/build/x86-integrated/src/Release/winmm.dll')), 10, 201)).toString('utf8');
 const dat = decodeResource(readResource(fs.readFileSync(path.join(root, 'out/build/x86-integrated/src/Release/winmm.dll')), 10, 202)).toString('utf8');
 const html = '<!doctype html><meta charset="utf-8"><div class="questionLi" data-question-id="one"><h3 class="mark_name">单选题：IMAGE choose Alpha <img src="/question.png"></h3><div class="answerBg" id="a">Alpha <img src="/option.png"></div><div class="answerBg" id="b">Beta</div></div>' +
-    '<div class="questionLi" data-question-id="two"><h3 class="mark_name" id="copyTitle">简答题：TEXT answer</h3><textarea id="textAnswer"></textarea></div>' +
+    '<div class="questionLi" data-question-id="two"><h3 class="mark_name" id="copyTitle">简答题：TEXT answer COPY-MARKER 3.14</h3><textarea id="textAnswer"></textarea></div>' +
     '<div class="questionLi" data-question-id="three"><h3 class="mark_name">判断题：JUDGE false</h3><div class="answerBg" id="yes">对</div><div class="answerBg" id="no">错</div></div>';
 
 test('copied upstream AI: auto collect and fill image questions, copy/click-fill, privacy and no legacy duplicate', { timeout: 35000 }, async () => {
@@ -27,7 +27,7 @@ test('copied upstream AI: auto collect and fill image questions, copy/click-fill
             if (u.hostname === 'ai.fixture.invalid') {
                 const body = JSON.parse(r.postData()); requests.push(body);
                 const prompt = body.messages[1].content[0].text;
-                const content = prompt.includes('COPY-MARKER') ? '3.14 "quoted" _value_' : prompt.includes('TEXT') ?
+                const content = !body.response_format && prompt.includes('COPY-MARKER') ? '3.14 "quoted" _value_' : prompt.includes('TEXT') ?
                     JSON.stringify({ type: 'text', answers: ['<img src=x onerror=window.pwned=1>'], needsReview: false }) : prompt.includes('JUDGE') ?
                         JSON.stringify({ type: 'judge', answers: ['错'], needsReview: false }) :
                         JSON.stringify({ type: 'single', choices: ['A'], needsReview: false });
@@ -60,14 +60,22 @@ test('copied upstream AI: auto collect and fill image questions, copy/click-fill
         assert.equal(await page.locator('#textAnswer').inputValue(), '<img src=x onerror=window.pwned=1>');
         assert.equal(await page.evaluate(() => !!window.pwned), false);
         assert(!other.some(p => /autoFreeAnswer|reportOnline/.test(p)), 'legacy worker does not send duplicate question requests');
+        await page.evaluate(() => {
+            __cxUpstreamAI.setPaused(true, false);
+            document.querySelector('#textAnswer').insertAdjacentHTML('beforebegin', '<div style="display:none"><textarea id="backing"></textarea></div>');
+        });
         await page.locator('#textAnswer').fill('');
         await page.evaluate(() => {
-            Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { readText: async () => '简答题 COPY-MARKER 3.14' } });
+            document.activeElement.blur();
             const range = document.createRange(); range.selectNodeContents(document.querySelector('#copyTitle'));
             const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
         });
         await page.keyboard.press('Control+c');
         await page.waitForFunction(() => window.copiedAIAnswer === '3.14 "quoted" _value_');
+        await page.locator('#copyTitle').click();
+        assert.equal(await page.locator('#backing').inputValue(), '');
+        assert.equal(await page.locator('#textAnswer').inputValue(), '');
+        assert.equal(await page.evaluate(() => window.copiedAIAnswer), '3.14 "quoted" _value_');
         await page.locator('#textAnswer').click();
         await page.waitForFunction(() => document.querySelector('#textAnswer').value === '3.14 "quoted" _value_');
         assert.equal(requests.length, 4, 'copy + Ctrl+C listeners merge into one request');
@@ -77,6 +85,46 @@ test('copied upstream AI: auto collect and fill image questions, copy/click-fill
         assert.equal(await page.evaluate(() => Array.from(document.body.children).some(node => node.style.position === 'fixed' && /AI答题/.test(node.textContent))), false);
         await page.keyboard.press('Control+g'); assert.equal(await page.locator('#cef-deepseek-settings').isHidden(), true);
         assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('AI-first falls back to the embedded legacy lookup and fills through the current worker', { timeout: 30000 }, async () => {
+    const browser = await chromium.launch({ channel: 'msedge', headless: true });
+    try {
+        const page = await browser.newPage(), legacyRequests = [], aiRequests = [];
+        const questions = '<div class="questionLi"><h3>1.（单选题）测试选项<img src="/legacy.png"></h3><div class="answerBg">甲</div><div class="answerBg" id="selected" onclick="this.classList.add(&quot;check_answer&quot;)">乙</div></div>' +
+            '<div class="questionLi"><h3>2.（简答题）测试文本</h3><textarea></textarea><button onclick="window.saved=(window.saved||0)+1">保存</button></div>';
+        await page.route('**/*', route => {
+            const req = route.request(), url = new URL(req.url());
+            if (req.isNavigationRequest()) return route.fulfill({ contentType: 'text/html;charset=utf-8', body: '<!doctype html>' + questions });
+            if (url.pathname === '/legacy.png') return route.fulfill({ contentType: 'image/png', body: png });
+            if (url.hostname === 'ai.fixture.invalid') {
+                aiRequests.push(req.postDataJSON());
+                return route.fulfill({ status: 503, json: {} });
+            }
+            if (url.pathname.endsWith('/autoFreeAnswer')) {
+                const data = req.postDataJSON();
+                legacyRequests.push(data);
+                return route.fulfill({ json: { code: 0, result: { success: data.type === 4, num: -1, answers: data.type === 4 ? ['题库文本'] : [['乙']] } } });
+            }
+            return route.fulfill({ json: { code: 0, result: [] } });
+        });
+        await page.goto('https://mooc1.chaoxing.com/exam-ans/exam/test/fallback');
+        await page.evaluate(() => { window.__CX_AI_CONFIG__ = { enabled: false, apiKey: 'fixture', baseUrl: 'https://ai.fixture.invalid' }; });
+        await page.evaluate(shim);
+        await page.evaluate(fs.readFileSync(path.join(root, 'scripts/userscript_boot.js'), 'utf8'));
+        await page.evaluate(code => __cefRunUserScript(() => new Function('$', 'jQuery', code).call(window, __wnJQ, __wnJQ)), dat);
+        await page.evaluate(() => {
+            __cefDeepSeek.openSettings();
+            __cefDeepSeek.configure({ enabled: true, apiKey: 'fixture', baseUrl: 'https://ai.fixture.invalid', mode: 'ai-first', answerDelayMs: 0 });
+        });
+        await page.waitForFunction(() => window.saved === 1);
+        assert.equal(await page.locator('#selected.check_answer').count(), 1);
+        assert.equal(await page.locator('.questionLi textarea').inputValue(), '题库文本');
+        assert.deepEqual(legacyRequests.map(data => data.type), [0, 4]);
+        assert.deepEqual(legacyRequests.map(data => data.question), ['测试选项<img src="/legacy.png">', '测试文本']);
+        assert.equal(aiRequests.length, 2);
+        assert.match(await page.locator('#cef-deepseek-settings').locator('#progressBody').textContent(), /DeepSeek 未成功 → 万能脚本题库/);
     } finally { await browser.close(); }
 });
 
@@ -103,7 +151,7 @@ test('enabled AI waits for dynamically rendered questions and fills them automat
         assert.equal(requests, 0, 'no request is made before questions exist');
         await page.evaluate(() => {
             document.querySelector('#app').innerHTML = '<div class="questionLi" data-question-id="late"><h3 class="mark_name">单选题：dynamic</h3><div class="answerBg" id="lateA">A</div><div class="answerBg" id="lateB">B</div></div>';
-            document.querySelector('#lateB').onclick = () => { window.dynamicFilled = true; };
+            document.querySelector('#lateB').onclick = function () { this.setAttribute('aria-checked', 'true'); window.dynamicFilled = true; };
         });
         await page.waitForFunction(() => window.dynamicFilled === true);
         assert.equal(requests, 1);

@@ -14,5 +14,8 @@
 # Runtime AI credentials (never commit)
 /config.json
 
+# Local question bank data (never commit)
+/question-bank.db*
+
 # Local VS Code configuration
 /.vscode/

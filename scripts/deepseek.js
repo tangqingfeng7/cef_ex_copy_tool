@@ -4,8 +4,11 @@
     if (w.__cefDeepSeek) return;
     var doc = w.document, revision = 0, running = 0, queue = [], active = new Set();
     var cache = new Map(), pending = new Map(), blocked = new Map(), cacheBytes = 0, dialog = null, chosenRoot = null;
+    var formBaselines = new WeakMap();
     var attached = new WeakMap(), imageVersions = new WeakMap(), probePending = false, nativeProxyReady = null;
     var lastStatus = { message: '', state: '' }, progressItems = new Map(), imageReports = new Map();
+    var bankRevision = 0, bankReviews = [], refreshBankReviews = null;
+    var bankReviewIds = new WeakMap(), nextBankReviewId = 0;
     var balanceEpoch = 0, balanceJob = null, balanceController = null;
     var balanceState = { message: 'API 余额 · 点击刷新查询', state: '', value: null, at: 0 };
     var stats = { requests: 0, probeRequests: 0, cacheHits: 0, status: 'disabled', lastCode: null, images: 0, transport: 'browser' };
@@ -47,6 +50,7 @@
             enabled: input.enabled === true || (input.enabled == null && typeof input.apiKey === 'string' && !!input.apiKey.trim()),
             universalScriptEnabled: input.universalScriptEnabled !== false,
             bankAnswerMode: input.bankAnswerMode === 'only' || input.bankAnswerMode === 'first' ? input.bankAnswerMode : 'off',
+            bankScope: typeof input.bankScope === 'string' ? input.bankScope.slice(0, 256) : '',
             apiKey: typeof input.apiKey === 'string' ? input.apiKey.trim() : '',
             baseUrl: typeof input.baseUrl === 'string' ? input.baseUrl.trim() : 'https://api.deepseek.com',
             model: typeof input.model === 'string' && input.model.trim() ? input.model.trim() : 'deepseek-flash',
@@ -177,15 +181,26 @@
     function clearProgress() {
         progressItems.clear(); renderProgress();
     }
-    function clear(reason) {
+    function clear(reason, answersOnly) {
         revision++; cache.clear(); pending.clear(); blocked.clear(); cacheBytes = 0;
-        active.forEach(function (controller) { controller.abort(); });
-        queue.splice(0).forEach(function (job) { if (job.cleanup) job.cleanup(); job.reject(fail('CANCELED', reason || '配置已更改，请重新请求')); });
+        active.forEach(function (controller) { if (!answersOnly || controller.answer || controller.bankAnswer) controller.abort(); });
+        for (var i = queue.length - 1; i >= 0; i--) {
+            var job = queue[i];
+            if (answersOnly && !job.answer) continue;
+            queue.splice(i, 1); job.cleanup(); job.reject(fail('CANCELED', reason || '配置已更改，请重新请求'));
+        }
         if (doc && doc.dispatchEvent && typeof CustomEvent !== 'undefined') doc.dispatchEvent(new CustomEvent('cef-ai-invalidated'));
+    }
+    function refreshBankAnswers() {
+        bankRevision++;
+        active.forEach(function (controller) { if (controller.bankAnswer) controller.abort(); });
+        doc.dispatchEvent(new CustomEvent('cef-ai-invalidated'));
+        doc.dispatchEvent(new CustomEvent('cef-ai-config-changed'));
     }
     function configure(input) {
         input = Object.assign({}, input);
         if (!Object.prototype.hasOwnProperty.call(input, 'bankAnswerMode')) input.bankAnswerMode = cfg.bankAnswerMode;
+        if (!Object.prototype.hasOwnProperty.call(input, 'bankScope')) input.bankScope = cfg.bankScope;
         if (!Object.prototype.hasOwnProperty.call(input, 'universalScriptEnabled')) input.universalScriptEnabled = cfg.universalScriptEnabled;
         if (!Object.prototype.hasOwnProperty.call(input, 'answeringPaused')) input.answeringPaused = cfg.answeringPaused;
         if (!Object.prototype.hasOwnProperty.call(input, 'panelOpacity')) input.panelOpacity = panelOpacity;
@@ -198,14 +213,16 @@
             balanceController = null; balanceJob = null;
             balanceState = { message: 'API 余额 · 点击刷新查询', state: '', value: null, at: 0 }; renderBalance();
         }
+        var bankChanged = next.bankAnswerMode !== cfg.bankAnswerMode || next.bankScope !== cfg.bankScope;
         var controlsOnly = Object.keys(next).every(function (key) {
-            return ['answerDelayMs', 'overwritePolicy', 'concurrency', 'panelOpacity', 'answeringPaused', 'panelBounds', 'hotkeys', 'universalScriptEnabled'].indexOf(key) >= 0 || next[key] === cfg[key];
+            return ['answerDelayMs', 'overwritePolicy', 'concurrency', 'panelOpacity', 'answeringPaused', 'panelBounds', 'hotkeys', 'universalScriptEnabled', 'bankAnswerMode', 'bankScope'].indexOf(key) >= 0 || next[key] === cfg[key];
         });
         if (controlsOnly) {
             cfg = next; setOpacity(next.panelOpacity, false); drain();
             renderHotkeyHints(); if (hotkeysChanged) queueNativeHotkeySync();
             if (w.__cxUpstreamAI && w.__cxUpstreamAI.setPaused) w.__cxUpstreamAI.setPaused(next.answeringPaused, false);
-            if (doc && doc.dispatchEvent && typeof CustomEvent !== 'undefined') doc.dispatchEvent(new CustomEvent('cef-ai-controls-changed'));
+            if (bankChanged) refreshBankAnswers();
+            else if (doc && doc.dispatchEvent && typeof CustomEvent !== 'undefined') doc.dispatchEvent(new CustomEvent('cef-ai-controls-changed'));
             return safeStatus();
         }
         clear(); imageReports.clear(); renderImagePreviews(); cfg = next; setOpacity(next.panelOpacity, false); renderHotkeyHints(); if (hotkeysChanged) queueNativeHotkeySync(); stats.status = enabled() ? 'idle' : 'disabled'; stats.lastCode = null;
@@ -329,10 +346,8 @@
         var job = configWriteTail.then(run);
         configWriteTail = job.catch(function () {}); return job;
     }
-    function persistConfig(input) {
-        var next = normalize(input); endpoint(next);
-        var hotkeysChanged = JSON.stringify(next.hotkeys) !== JSON.stringify(cfg.hotkeys);
-        return enqueueConfigWrite(function () { return writeConfigNow(next); });
+    function persistConfig(changes) {
+        return enqueueConfigWrite(function () { return writeConfigNow(changes); });
     }
     function configRequest(url, method, body, contentType) {
         return new Promise(function (resolve, reject) {
@@ -354,12 +369,15 @@
             xhr.send(body == null ? null : body);
         });
     }
-    async function writeConfigNow(next) {
+    async function writeConfigNow(changes) {
+        var next = normalize(Object.assign({}, diskConfig, changes)); endpoint(next);
+        var patch = {};
+        Object.keys(changes).forEach(function (key) { if (Object.prototype.hasOwnProperty.call(next, key)) patch[key] = next[key]; });
         if (!w.__cefNativeAiProxy || w.__cefNativeAiProxy.configWrite !== true || !nativeProxyConfigUrl())
             throw fail('CONFIG_SAVE', 'DLL 配置保存通道未就绪，请确认已替换最新 winmm.dll 并重启客户端');
         var health = await configRequest(nativeProxyHealthUrl(), 'GET');
         if (health.status !== 200 || health.text.trim() !== '{"cefCxAiProxy":1}') throw fail('CONFIG_SAVE', '原生配置路由未就绪，请完全重启客户端后点击重试');
-        var response = await configRequest(nativeProxyConfigUrl(), 'POST', JSON.stringify(next));
+        var response = await configRequest(nativeProxyConfigUrl(), 'POST', JSON.stringify(patch));
         var result;
         try { result = JSON.parse(response.text); } catch (_) { result = null; }
         if (response.status !== 200) {
@@ -368,16 +386,21 @@
         }
         if (!result || result.saved !== true) throw fail('CONFIG_SAVE', 'DLL 未确认配置保存结果');
         diskConfig = Object.assign({}, next);
-        if (Object.keys(pendingPreferences).every(function (key) { return key === 'panelBounds' ? JSON.stringify(next[key]) === JSON.stringify(pendingPreferences[key]) : next[key] === pendingPreferences[key]; })) {
-            opacitySavedRevision = opacityRevision; pendingPreferences = {}; opacitySaveStatus('已保存', '');
+        Object.keys(pendingPreferences).forEach(function (key) {
+            if (!Object.prototype.hasOwnProperty.call(patch, key)) return;
+            if (key === 'panelBounds' ? JSON.stringify(patch[key]) === JSON.stringify(pendingPreferences[key]) : patch[key] === pendingPreferences[key])
+                delete pendingPreferences[key];
+        });
+        if (!Object.keys(pendingPreferences).length) {
+            opacitySavedRevision = opacityRevision; opacitySaveStatus('已保存', '');
         }
         return next;
     }
-    function schedule(run, signal) {
+    function schedule(run, signal, answerJob) {
         if (queue.length >= 64) return Promise.reject(fail('QUEUE', '等待任务过多，请稍后重试'));
         if (signal && signal.aborted) return Promise.reject(fail('CANCELED', '请求已取消'));
         return new Promise(function (resolve, reject) {
-            var job = { run: run, resolve: resolve, reject: reject };
+            var job = { run: run, resolve: resolve, reject: reject, answer: answerJob };
             var abort = function () { var i = queue.indexOf(job); if (i >= 0) { queue.splice(i, 1); if (job.cleanup) job.cleanup(); reject(fail('CANCELED', '排队请求已取消')); } };
             job.cleanup = function () { if (signal) signal.removeEventListener('abort', abort); };
             if (signal) signal.addEventListener('abort', abort);
@@ -390,51 +413,141 @@
         if (!state) { state = { version: 0 }; imageVersions.set(node, state); node.addEventListener('load', function () { state.version++; }); }
         return state.version;
     }
-    function imageSource(img) {
-        return img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-original') ||
+    function declaredImageSource(img) {
+        return img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-original') ||
             img.getAttribute('data-lazy-src') || img.getAttribute('data-actualsrc') || img.getAttribute('data-url') || '';
+    }
+    function imageSource(img) {
+        var declared = declaredImageSource(img);
+        return img.complete ? img.currentSrc || declared : declared || img.currentSrc;
     }
     function rootOf(data) { return data.$item && (data.$item[0] || data.$item.nodeType && data.$item) || data.root || null; }
     function domStamp(root) {
-        if (!root) return '';
-        return JSON.stringify([root.textContent, Array.prototype.map.call(root.querySelectorAll('img'), function (img) {
-            return [imageSource(img), imageVersion(img), !!img.complete, img.naturalWidth || 0, img.naturalHeight || 0];
-        }), Array.prototype.map.call(root.querySelectorAll('input:not([type=hidden]),textarea,[contenteditable=true]'), function (node) {
-            return [node.value || node.textContent || '', !!node.checked];
-        })]);
+        if (!root) return null;
+        var inputs = Array.from(root.querySelectorAll('input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]),textarea,[contenteditable=true]'), function (node) {
+            return [node, JSON.stringify([typeof node.value === 'string' ? node.value : node.innerHTML, !!node.checked])];
+        });
+        root.querySelectorAll('div.answerBg').forEach(function (option) {
+            inputs.push([option, !!(option.matches('.check_answer,.check_answer_dx,[aria-checked=true]') ||
+                option.querySelector('.check_answer,.check_answer_dx,input:checked,[aria-checked=true]'))]);
+        });
+        root.querySelectorAll('iframe').forEach(function (frame) {
+            var frameDoc = frame.contentDocument, body = frameDoc && frameDoc.body;
+            if (body && (body.isContentEditable || frameDoc.designMode === 'on' || body.querySelector('[contenteditable=true]') ||
+                frame.closest('.eidtDiv,.textDIV,.Cy_ulTk li,.fill_blank'))) inputs.push([frame, body.innerHTML]);
+        });
+        return { inputs: inputs, content: JSON.stringify([root.textContent, Array.from(root.querySelectorAll('img'), function (img) {
+            return [declaredImageSource(img), img.srcset, img.sizes];
+        })]) };
+    }
+    function mediaPosition(node, container, type) {
+        if (!container || !container.contains(node) || container === node) return null;
+        var range = doc.createRange();
+        var omitLabels = type == null && container.querySelector('.mark_letter');
+        function text() {
+            if (!omitLabels) return range.toString();
+            var fragment = range.cloneContents();
+            fragment.querySelectorAll('.mark_letter').forEach(function (label) { label.remove(); });
+            return fragment.textContent;
+        }
+        range.selectNodeContents(container); range.setEndBefore(node);
+        var before = text();
+        range.selectNodeContents(container); range.setStartAfter(node);
+        var anchor = bankImageAnchor(before, text(), type);
+        return anchor.text ? anchor : null;
     }
     function snapshot(data) {
         var root = rootOf(data), items = [], options = Array.prototype.slice.call(data.options || []).map(plain);
-        var optionNodes = data.$options ? Array.prototype.slice.call(data.$options) : [];
-        function add(node, src, label) {
+        var type = Number(data.type), targets = data.$options ? Array.prototype.slice.call(data.$options) : [];
+        var writing = type === 2 || type === 4, optionNodes = writing ? [] : targets;
+        var stem = root && (data.stemNode || root.querySelector('h3.mark_name,h3,.mark_name') || root);
+        function imageOptionIndex(node) {
+            var index = optionNodes.findIndex(function (option) { return option === node || option.contains(node); });
+            if (index >= 0) return index;
+            // Formula renderers can place the image beside answerBg rather than
+            // inside it. Walk only within this question and require unique ownership.
+            for (var parent = node.parentElement; parent && parent !== root; parent = parent.parentElement) {
+                var owners = [];
+                optionNodes.forEach(function (option, i) { if (parent.contains(option)) owners.push(i); });
+                if (owners.length === 1) return owners[0];
+                if (owners.length > 1) break;
+            }
+            return -1;
+        }
+        function add(node, src, label, anchorRoot, anchorType, anchor) {
             if (!src) throw fail('IMAGE', '题目图片尚未加载，请等待图片显示后重试');
-            if (items.some(function (item) { return item.src === src && item.label === label; })) return;
-            items.push({ node: node, src: src, label: label });
+            if (!node && !anchor && items.some(function (item) { return !item.node && !item.anchor && item.src === src && item.label === label; })) return;
+            items.push({ node: node, src: src, label: label, anchorRoot: anchorRoot, anchorType: anchorType,
+                anchor: node ? mediaPosition(node, anchorRoot, anchorType) : anchor || null });
+        }
+        function isQuestionMedia(node) {
+            // A review page may keep answer/analysis media inside questionLi,
+            // including collapsed sections. They must never become stem evidence.
+            return !node.closest('.rightAnswerContent,.stuAnswerContent,.qtAnalysis,.analysis,.mark_answer,.aiAssistant,#cef-deepseek-settings') &&
+                !(writing && node.closest('[contenteditable]:not([contenteditable=false])'));
         }
         if (root) {
-            Array.prototype.forEach.call(root.querySelectorAll('img'), function (img) {
-                var index = optionNodes.findIndex(function (node) { return node === img || node.contains(img); });
-                add(img, imageSource(img), index < 0 ? '题干图片' : '选项 ' + String.fromCharCode(65 + index) + ' 图片');
-            });
-            Array.prototype.forEach.call(root.querySelectorAll('canvas'), function (canvas) {
-                try { add(null, canvas.toDataURL('image/png'), '题干画布'); } catch (_) { throw fail('IMAGE', '题干画布不可读取，请刷新页面后重试'); }
+            Array.prototype.forEach.call(root.querySelectorAll('img,canvas'), function (node) {
+                if (!isQuestionMedia(node)) return;
+                var index = imageOptionIndex(node), canvas = node.tagName === 'CANVAS', src;
+                var option = optionNodes[index], content = option && (option.querySelector('.answer_p') || option.querySelector('div.clearfix') || option);
+                if (canvas) {
+                    try { src = node.toDataURL('image/png'); }
+                    catch (_) { throw fail('IMAGE', '题干画布不可读取，请刷新页面后重试'); }
+                } else src = imageSource(node);
+                add(node, src, option ? '选项 ' + String.fromCharCode(65 + index) + ' 图片' : canvas ? '题干画布' : '题干图片',
+                    option ? content : stem, option ? null : type);
             });
             (attached.get(root) || []).forEach(function (src) { add(null, src, '用户附图'); });
         }
         if (!root) {
             [data.question].concat(data.options || []).forEach(function (html, index) {
-                String(html || '').replace(/<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi, function (_, src) {
-                    add(null, src, index ? '选项 ' + String.fromCharCode(64 + index) + ' 图片' : '题干图片'); return '';
+                String(html || '').replace(/<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi, function (tag, src, offset, value) {
+                    var anchor = bankImageAnchor(plain(value.slice(0, offset)), plain(value.slice(offset + tag.length)), index ? null : type);
+                    add(null, src, index ? '选项 ' + String.fromCharCode(64 + index) + ' 图片' : '题干图片', null, null, anchor); return '';
                 });
             });
         }
         if (Array.isArray(data.images)) data.images.forEach(function (src) { add(null, src, '用户附图'); });
-        if (items.length > cfg.maxImages) throw fail('IMAGE_LIMIT', '图片过多，请缩小到当前一道题');
-        return { question: plain(data.question), options: options, type: Number(data.type), images: items, textMode: data.__textMode === true,
-            root: root, document: doc, stamp: domStamp(root), revision: revision,
+        return { question: plain(data.question), options: options, type: type, images: items, textMode: data.__textMode === true,
+            root: root, document: doc, stamp: domStamp(root), revision: revision, bankRevision: data.__textMode === true ? null : bankRevision,
             blanks: data.$options && data.$options.length || 0, retry: data.__cefAIRetry === true };
     }
-    function isCurrent(s) { return s.revision === revision && (!s.root || s.root.ownerDocument === doc && s.root.isConnected && domStamp(s.root) === s.stamp); }
+    function snapshotState(s) {
+        if (s.revision !== revision || s.bankRevision != null && s.bankRevision !== bankRevision) return 'STALE';
+        if (s.root) {
+            var current = domStamp(s.root), before = s.stamp.inputs;
+            if (current.inputs.some(function (entry, index) { return !before[index] || before[index][1] !== entry[1]; }) ||
+                current.inputs.length !== before.length) {
+                var byNode = new Map(before);
+                return current.inputs.some(function (entry) { return byNode.has(entry[0]) && byNode.get(entry[0]) !== entry[1]; }) ? 'STALE_EDIT' : 'STALE';
+            }
+            if (s.root.ownerDocument !== doc || !s.root.isConnected || current.content !== s.stamp.content) return 'STALE';
+        }
+        return s.images.every(function (item) {
+            return item.capturedVersion == null || imageVersion(item.node) === item.capturedVersion && imageSource(item.node) === item.capturedSource;
+        }) ? '' : 'STALE';
+    }
+    function isCurrent(s) { return !snapshotState(s); }
+    function answerState(s) {
+        var state = snapshotState(s);
+        if (state) return state;
+        var previous, redrawn = false;
+        var sameMedia = s.images.every(function (item) {
+            if (!item.node) return true;
+            if (!s.root.contains(item.node) || previous && !(previous.compareDocumentPosition(item.node) & w.Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+            previous = item.node;
+            if (item.anchor) {
+                var current = mediaPosition(item.node, item.anchorRoot, item.anchorType);
+                if (!current || current.text !== item.anchor.text || current.prefix !== item.anchor.prefix || current.inline !== item.anchor.inline) return false;
+            }
+            if (item.node.tagName !== 'CANVAS') return true;
+            try { if (item.node.toDataURL('image/png') !== item.src) redrawn = true; }
+            catch (_) { return false; }
+            return true;
+        });
+        return !sameMedia ? 'STALE' : redrawn ? 'STALE_CANVAS' : '';
+    }
     function readBlob(blob, dataUrl) {
         return new Promise(function (resolve, reject) {
             var reader = new FileReader(); reader.onerror = function () { reject(fail('IMAGE', '图片读取失败')); };
@@ -479,7 +592,7 @@
     }
     async function captureRenderedImage(img, controller, c) {
         if (!img) return '';
-        await waitForImage(img, controller);
+        if (img.tagName !== 'CANVAS') await waitForImage(img, controller);
         var width = img.naturalWidth || img.width, height = img.naturalHeight || img.height;
         if (!width || !height || width > 8192 || height > 8192 || width * height > 32 * 1024 * 1024)
             throw fail('IMAGE_LIMIT', '题图尺寸无效或过大');
@@ -492,12 +605,17 @@
     }
     async function captureImage(item, controller, c) {
         var rendered = await captureRenderedImage(item.node, controller, c);
+        var source = item.src;
+        if (item.node && item.node.tagName === 'IMG') {
+            item.capturedVersion = imageVersion(item.node);
+            item.capturedSource = source = imageSource(item.node);
+        }
         if (rendered) return rendered;
         var url;
-        try { url = new URL(item.src, doc.baseURI); } catch (_) { throw fail('IMAGE', '图片地址无效'); }
+        try { url = new URL(source, doc.baseURI); } catch (_) { throw fail('IMAGE', '图片地址无效'); }
         if (url.protocol !== 'data:' && url.protocol !== 'blob:' && url.protocol !== 'https:' && !(url.protocol === 'http:' && url.origin === w.location.origin))
             throw fail('IMAGE', '图片地址协议不允许');
-        if (url.protocol === 'data:' && !/^data:image\/(png|jpeg|gif|webp);base64,/i.test(item.src)) throw fail('IMAGE_FORMAT', '图片格式不支持');
+        if (url.protocol === 'data:' && !/^data:image\/(png|jpeg|gif|webp);base64,/i.test(source)) throw fail('IMAGE_FORMAT', '图片格式不支持');
         // No API authorization is ever sent to image servers. Authenticated same-origin images may use their normal cookies.
         var response;
         try { response = await fetch(url.href, { signal: controller.signal, mode: 'cors', credentials: 'same-origin', referrerPolicy: 'same-origin' }); }
@@ -584,7 +702,7 @@
         if (!Array.isArray(answers) || answers.length !== 1 || typeof answers[0] !== 'string') return raw;
         return { type: 'text', answers: answers, needsReview: adapted || raw.needsReview == null ? true : raw.needsReview };
     }
-    function validateAnswer(raw, s) {
+    function validateAnswer(raw, s, textLimit = 16000) {
         raw = normalizeJudgeSchema(raw, s);
         raw = normalizeTextSchema(raw, s);
         var expected = expectedType(s), label = { single: '单选', multiple: '多选', judge: '判断', blank: '填空', text: '简答' }[expected];
@@ -601,7 +719,7 @@
             if (new Set(result).size !== result.length || raw.type === 'single' && result.length !== 1) throw fail('FORMAT', 'AI 返回的选项数量不正确');
         } else {
             if (!Array.isArray(raw.answers) || !raw.answers.length || raw.answers.length > 64) throw fail('FORMAT', 'AI 返回的答案为空');
-            result = raw.answers.map(function (x) { if (typeof x !== 'string' || !x.trim() || x.length > 16000) throw fail('FORMAT', 'AI 返回的文本答案不正确'); return x; });
+            result = raw.answers.map(function (x) { if (typeof x !== 'string' || !x.trim() || x.length > textLimit) throw fail('FORMAT', '文本答案不正确'); return x; });
             if ((raw.type === 'judge' || raw.type === 'text') && result.length !== 1 || raw.type === 'blank' && s.blanks && result.length !== s.blanks) throw fail('FORMAT', '答案数量与题目不匹配');
             if (raw.type === 'judge' && !/^(正确|错误|对|错|是|否|true|false)$/i.test(result[0])) throw fail('FORMAT', '判断题答案不正确');
         }
@@ -616,6 +734,24 @@
         cache.set(key, { value: value, error: error, at: Date.now() }); cacheBytes += key.length * 2;
         while (cache.size > 24 || cacheBytes > 24 * 1024 * 1024) { var first = cache.keys().next().value; cache.delete(first); cacheBytes -= first.length * 2; }
     }
+    function bankMatchText(value) {
+        var text = String(value || '').replace(/\[图片:[^\]]+\]|\[附图\]/g, '')
+            .replace(/[\uff01-\uff5e]/g, function (ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xfee0); })
+            .replace(/[\u200b\ufeff\u2060\u00ad]/g, '').replace(/。/g, '.')
+            .replace(/[‘’]/g, "'").replace(/[“”]/g, '"')
+            .replace(/[\s\u2000-\u200a\u202f]+/g, ' ').trim()
+            .replace(/([^A-Za-z0-9_]) +| +(?=[^A-Za-z0-9_])/g, '$1');
+        // Match the native option projection for a hidden curl URL placeholder.
+        return /^`?curl/.test(text) ? text.replace(/<URL>(`?)$/, '$1') : text;
+    }
+    function bankImageAnchor(before, after, type) {
+        function text(value) {
+            if (type != null && typeof w !== 'undefined' && w.__cefParseBankDocx) value = w.__cefParseBankDocx.stripStemHeadings(cleanQuestionStem(value, type));
+            return bankMatchText(value);
+        }
+        var prefix = text(before), full = text(before + after);
+        return { text: full, prefix: prefix, inline: !!(prefix && bankMatchText(after)) };
+    }
     function cleanQuestionStem(value, type) {
         var text = String(value || '').trim();
         if (Number(type) === 3) {
@@ -627,60 +763,104 @@
     }
     function lookupBank(s) {
         if (!w.__cefNativeAiProxy || !w.__cefNativeAiProxy.questionBank) return Promise.reject(fail('BANK_ERROR', '请更新 DLL 后使用本地题库答题'));
-        
-        // Strip only a recognized question-type heading, never arbitrary numeric content.
-        var alternate = cleanQuestionStem(s.question, s.type).replace(/^\s*(?:(?:第\s*)?\d+\s*[.、．:：]\s*)?[（(【\[]\s*(?:单选题|多选题|判断题|填空题|简答题|问答题|论述题|编程题|程序设计题)(?:\s*[,，]\s*\d+(?:\.\d+)?\s*分)?\s*[）)】\]]\s*/, '');
+
+        // Query the original stem alongside the Word-style stem to detect conflicting answers.
+        var alternate = w.__cefParseBankDocx.stripStemHeadings(cleanQuestionStem(s.question, s.type));
         var type = expectedType(s);
-        var payload = { action: 'lookup', hasImages: s.images.length > 0, stem: s.question, alternateStem: alternate, type: type === 'judge' ? 'boolean' : type, blanks: s.blanks,
-            options: s.options.map(function (text, index) { return text.replace(new RegExp('^\\s*' + String.fromCharCode(65 + index) + '[.、．:：]\\s*'), ''); }) };
+        var payload = { action: 'lookup', bank: cfg.bankScope, hasImages: s.images.length > 0, stem: s.question, alternateStem: alternate, type: type === 'judge' ? 'boolean' : type, blanks: s.blanks,
+            options: s.options };
+        return bankRequest(payload, 15000, true);
+    }
+    function bankRequest(payload, timeout, tracked) {
         return new Promise(function (resolve, reject) {
-            var xhr = new XMLHttpRequest(), controller = new AbortController(); active.add(controller);
+            var xhr = new XMLHttpRequest(), controller = new AbortController();
+            if (tracked) { controller.bankAnswer = true; active.add(controller); }
             function finish(error, result) { active.delete(controller); controller.signal.removeEventListener('abort', abort); if (error) reject(error); else resolve(result); }
             function abort() { xhr.abort(); }
             controller.signal.addEventListener('abort', abort);
             try {
-                xhr.open('POST', new URL('/__cef_cx_ai_proxy__/question-bank', w.location.origin).href, true); xhr.timeout = 15000;
+                xhr.open('POST', new URL('/__cef_cx_ai_proxy__/question-bank', w.location.origin).href, true); xhr.timeout = timeout || 120000;
                 xhr.setRequestHeader('Content-Type', 'application/json'); xhr.setRequestHeader('X-Cef-Cx-Question-Bank', '1');
                 xhr.onload = function () {
-                    try { var result = JSON.parse(xhr.responseText); if (xhr.status !== 200 || !result.ok) throw fail('BANK_ERROR', result.error || '本地题库查询失败'); finish(null, result); }
+                    try { var result = JSON.parse(xhr.responseText); if (xhr.status !== 200 || !result.ok) throw fail(result.code || 'BANK_ERROR', result.error || '本地题库查询失败'); finish(null, result); }
                     catch (error) { finish(error.code ? error : fail('BANK_ERROR', '本地题库响应格式无效')); }
                 };
                 xhr.onerror = function () { finish(fail('BANK_ERROR', '无法连接本地题库')); };
-                xhr.ontimeout = function () { finish(fail('BANK_ERROR', '题库匹配超时，请缩小题库后重试')); };
+                xhr.ontimeout = function () { finish(fail('BANK_ERROR', '题库操作超时，请刷新状态后重试')); };
                 xhr.onabort = function () { finish(fail('CANCELED', '题库查询已取消')); };
                 xhr.send(JSON.stringify(payload));
             } catch (error) { finish(fail('BANK_ERROR', error.message || '无法查询本地题库')); }
         });
     }
+    function recordBankReview(s, local) {
+        var reason = local.matched ? (local.answer && local.answer.needsReview ? 'needs-review' : 'matched') : local.reason || 'error';
+        var identity = null;
+        if (s.root) {
+            if (!bankReviewIds.has(s.root)) bankReviewIds.set(s.root, ++nextBankReviewId);
+            identity = bankReviewIds.get(s.root);
+        } else if (s.images.length) {
+            identity = local.matchedQuestion ? 'bank:' + local.matchedQuestion.dbId : ++nextBankReviewId;
+        }
+        var key = JSON.stringify([identity, s.type, s.question, s.options, s.blanks]);
+        var candidates = local.review || [];
+        if (local.matchedQuestion) {
+            var hit = local.matchedQuestion;
+            candidates = [{ dbId: hit.dbId, bank: hit.bank, stem: hit.stem, matched: true }].concat(candidates.filter(function (q) { return q.dbId !== hit.dbId; })).slice(0, 8);
+        }
+        bankReviews = bankReviews.filter(function (entry) { return entry.key !== key; });
+        bankReviews.unshift({ key: key, question: s.question, options: s.options.slice(), blanks: s.blanks, imageCount: s.images.length,
+            reason: reason, detail: local.detail || '', bank: local.bank || '', answer: local.answer || null, candidates: candidates, at: Date.now() });
+        // Bound text snapshots; never retain page nodes or image data here.
+        while (bankReviews.length > 100 || bankReviews.length > 1 && JSON.stringify(bankReviews).length > 1024 * 1024) bankReviews.pop();
+        if (refreshBankReviews) refreshBankReviews();
+    }
     async function bankImagePixels(url, signal) {
+        var image = await loadBankImage(url, signal);
+        try {
+            var canvas = doc.createElement('canvas'); canvas.width = canvas.height = 96;
+            var context = canvas.getContext('2d'); context.fillStyle = '#fff'; context.fillRect(0, 0, 96, 96); context.drawImage(image, 0, 0, 96, 96);
+            return { ratio: image.naturalWidth / image.naturalHeight, pixels: context.getImageData(0, 0, 96, 96).data };
+        } catch (_) { throw fail('BANK_IMAGE', '无法读取题图像素'); }
+    }
+    function loadBankImage(url, signal) {
         return new Promise(function (resolve, reject) {
             var image = new Image(), timer = setTimeout(function () { finish(fail('BANK_IMAGE', '题图解码超时')); }, 15000);
             function abort() { finish(fail('CANCELED', '图片匹配已取消')); }
-            function finish(error, value) { clearTimeout(timer); image.onload = image.onerror = null; signal.removeEventListener('abort', abort); if (error) reject(error); else resolve(value); }
-            signal.addEventListener('abort', abort);
-            image.onload = function () {
-                try {
-                    var canvas = doc.createElement('canvas'); canvas.width = canvas.height = 96;
-                    var context = canvas.getContext('2d'); context.fillStyle = '#fff'; context.fillRect(0, 0, 96, 96); context.drawImage(image, 0, 0, 96, 96);
-                    finish(null, { ratio: image.naturalWidth / image.naturalHeight, pixels: context.getImageData(0, 0, 96, 96).data });
-                } catch (_) { finish(fail('BANK_IMAGE', '无法读取题图像素，未填入')); }
-            };
-            image.onerror = function () { finish(fail('BANK_IMAGE', '题库图片无法解码，未填入')); };
-            if (signal.aborted) abort(); else image.src = url;
+            function finish(error) { clearTimeout(timer); image.onload = image.onerror = null; if (signal) signal.removeEventListener('abort', abort); if (error) reject(error); else resolve(image); }
+            if (signal) signal.addEventListener('abort', abort);
+            image.onload = function () { finish(); };
+            image.onerror = function () { finish(fail('BANK_IMAGE', '题库图片无法解码')); };
+            if (signal && signal.aborted) abort(); else image.src = url;
         });
     }
     function sameBankImage(a, b) {
         if (Math.abs(a.ratio / b.ratio - 1) > 0.02) return false;
-        var difference = 0, changed = 0, channels = 0;
-        for (var i = 0; i < a.pixels.length; i++) {
-            if (i % 4 === 3) continue;
-            var delta = Math.abs(a.pixels[i] - b.pixels[i]); difference += delta; if (delta > 24) changed++; channels++;
+        var size = 96, tile = 6, difference = 0, changed = 0, channels = size * size * 3;
+        // A changed stroke can fall below both whole-image limits. Opposite
+        // pixel changes around a resampled edge can cancel within a tile.
+        for (var y = 0; y < size; y += tile) {
+            for (var x = 0; x < size; x += tile) {
+                var red = 0, green = 0, blue = 0;
+                for (var row = y; row < y + tile; row++) {
+                    var start = (row * size + x) * 4, end = start + tile * 4;
+                    for (var i = start; i < end; i += 4) {
+                        var r = a.pixels[i] - b.pixels[i], g = a.pixels[i + 1] - b.pixels[i + 1], bDelta = a.pixels[i + 2] - b.pixels[i + 2];
+                        red += r; green += g; blue += bDelta;
+                        var absR = Math.abs(r), absG = Math.abs(g), absB = Math.abs(bDelta);
+                        difference += absR + absG + absB;
+                        if (absR > 24) changed++;
+                        if (absG > 24) changed++;
+                        if (absB > 24) changed++;
+                    }
+                }
+                if (Math.max(Math.abs(red), Math.abs(green), Math.abs(blue)) > 18 * tile * tile) return false;
+            }
         }
         return difference / channels <= 3 && changed / channels <= 0.01;
     }
     async function matchImageBank(s, c, candidates) {
         if (!candidates.length) return { matched: false, reason: 'not-found' };
-        var controller = new AbortController(); active.add(controller);
+        var controller = new AbortController(); controller.bankAnswer = true; active.add(controller);
         var timer = setTimeout(function () { controller.abort(); }, 60000);
         try {
             var pageGroups = { stem: [] }, images = new Map();
@@ -689,69 +869,231 @@
                 var item = s.images[i], option = /^选项 ([A-Z]) 图片$/.exec(item.label), group = option ? option[1] : 'stem';
                 var url = await captureImage(item, controller, c);
                 if (!pageGroups[group]) pageGroups[group] = [];
-                pageGroups[group].push(await bankImagePixels(url, controller.signal));
+                pageGroups[group].push({ pixels: await bankImagePixels(url, controller.signal), anchor: item.anchor });
             }
-            function plainImageText(value) { return String(value || '').replace(/\[图片:[^\]]+\]|\[附图\]/g, '').replace(/\s+/g, ' ').trim(); }
-            async function equalGroup(value, page) {
-                var ids = [], pattern = /\[图片:([^\]]+)\]/g, match;
-                while ((match = pattern.exec(value))) ids.push(match[1]);
+            function plainImageText(value) { return bankMatchText(value); }
+            function imageRefs(value) {
+                var refs = [], pattern = /\[图片:([^\]]+)\]/g, match;
+                while ((match = pattern.exec(value))) refs.push({ id: match[1], before: match.index, after: pattern.lastIndex });
+                return refs;
+            }
+            function sameImage(value, ref, page, type) {
+                var data = images.get(ref.id);
+                if (!data) return false;
+                if (page.anchor) {
+                    var stored = bankImageAnchor(value.slice(0, ref.before), value.slice(ref.after), type);
+                    if (page.anchor.text === stored.text && (page.anchor.inline || stored.inline) && page.anchor.prefix !== stored.prefix) return false;
+                }
+                return sameBankImage(data, page.pixels);
+            }
+            function equalGroup(value, page, type) {
+                var refs = imageRefs(value);
                 page = page || [];
-                if (ids.length !== page.length) return false;
-                for (var j = 0; j < ids.length; j++) {
-                    var data = images.get(ids[j]);
-                    if (!data || !sameBankImage(await bankImagePixels(data, controller.signal), page[j])) return false;
+                if (refs.length !== page.length) return false;
+                for (var j = 0; j < refs.length; j++) {
+                    if (!sameImage(value, refs[j], page[j], type)) return false;
                 }
                 return true;
             }
-            var accepted = null, bank = '';
+            function visibleStemSubset(value, page, allowUnmatched) {
+                var refs = imageRefs(value);
+                if (!page || !page.length || page.length >= refs.length) return false;
+                // Match occurrences, not unique image IDs. The same formula may
+                // legitimately occur twice in one stem. Uniqueness belongs to
+                // the question candidate, checked after all candidates are read.
+                var edges = [], owners = [];
+                for (var i = 0; i < page.length; i++) {
+                    var matches = [];
+                    for (var j = 0; j < refs.length; j++) {
+                        if (sameImage(value, refs[j], page[i], s.type)) matches.push(j);
+                    }
+                    if (matches.length) edges.push(matches);
+                    else if (!allowUnmatched) return false;
+                }
+                function assign(index, visited) {
+                    for (var k = 0; k < edges[index].length; k++) {
+                        var slot = edges[index][k];
+                        if (visited.has(slot)) continue;
+                        visited.add(slot);
+                        if (owners[slot] == null || assign(owners[slot], visited)) { owners[slot] = index; return true; }
+                    }
+                    return false;
+                }
+                for (var index = 0; index < edges.length; index++) if (!assign(index, new Set())) return false;
+                return edges.length > 0;
+            }
+            function hasExtraStemImages(value, page) {
+                var refs = imageRefs(value);
+                if (!refs.length || page.length <= refs.length) return false;
+                var used = new Set();
+                for (var j = 0; j < refs.length; j++) {
+                    var index = -1;
+                    for (var i = 0; i < page.length; i++) {
+                        if (!sameImage(value, refs[j], page[i], s.type)) continue;
+                        if (index !== -1 || used.has(i)) return false;
+                        index = i;
+                    }
+                    if (index === -1) return false;
+                    used.add(index);
+                }
+                return true;
+            }
+            var accepted = null, selected = null, mismatch = '', blankCountMismatch = false, damaged = [];
             for (var n = 0; n < candidates.length; n++) {
                 var candidate = candidates[n], q = candidate.question; images.clear();
-                q.images.forEach(function (image) { images.set(image.id, image.dataUrl); });
-                if (!await equalGroup(q.stem, pageGroups.stem)) continue;
-                var type = expectedType(s), raw = { type: type, needsReview: false };
+                var assets = new Map(q.images.map(function (image) { return [image.id, image.dataUrl]; }));
+                var references = new Set(imageRefs(q.stem).map(function (ref) { return ref.id; }));
+                q.options.forEach(function (option) { imageRefs(option.text).forEach(function (ref) { references.add(ref.id); }); });
+                try {
+                    for (var id of references) {
+                        if (!assets.has(id)) throw fail('BANK_IMAGE', '缺少图片附件');
+                        images.set(id, await bankImagePixels(assets.get(id), controller.signal));
+                    }
+                } catch (error) {
+                    if (error.code !== 'BANK_IMAGE') throw error;
+                    damaged.push(candidate.bank + (candidate.dbId ? ' #' + candidate.dbId : '') + ' [图片:' + id + ']');
+                    continue;
+                }
+                var type = expectedType(s), partial = false;
+                // A malformed preview can lose one distractor and append its image
+                // to a remaining option. Recover only with an exact text stem and
+                // a unique record; never recover a missing/altered correct choice.
+                if (type === 'single' && candidates.length === 1 && candidate.exactStem &&
+                    q.options.length === 4 && s.options.length === 3 && !pageGroups.stem.length &&
+                    !/\[图片:/.test(q.stem)) {
+                    var recoveryMap = {}, usedIds = new Set(), recoveryValid = true;
+                    for (var ri = 0; ri < s.options.length; ri++) {
+                        var rl = String.fromCharCode(65 + ri), rt = plainImageText(s.options[ri]);
+                        var ro = q.options.filter(function (option) { return rt && plainImageText(option.text) === rt && !/\[图片:/.test(option.text); });
+                        if (ro.length !== 1 || usedIds.has(ro[0].id)) { recoveryValid = false; break; }
+                        usedIds.add(ro[0].id); recoveryMap[ro[0].id] = rl;
+                    }
+                    var missingOptions = q.options.filter(function (option) { return !usedIds.has(option.id); });
+                    var displaced = [].concat.apply([], Object.keys(pageGroups).filter(function (key) { return key !== 'stem'; }).map(function (key) { return pageGroups[key]; }));
+                    var correctLabel = recoveryMap[q.answer[0]];
+                    if (recoveryValid && missingOptions.length === 1 && q.answer.length === 1 && correctLabel &&
+                        !(pageGroups[correctLabel] || []).length && displaced.length && equalGroup(missingOptions[0].text, displaced)) {
+                        if (candidate.conflict) return { matched: false, reason: 'ambiguous' };
+                        accepted = { type: type, needsReview: true, choices: [correctLabel] }; selected = candidate;
+                        continue;
+                    }
+                }
+                if ((type === 'single' || type === 'multiple') && q.options.length !== s.options.length) {
+                    mismatch = '页面有 ' + s.options.length + ' 个选项，题库有 ' + q.options.length + ' 个，题目内容不完整或版本不同';
+                    continue;
+                }
+                if (!equalGroup(q.stem, pageGroups.stem, s.type)) {
+                    // Recovery for stray preview images requires a unique candidate
+                    // and four complete text options, mapped individually below.
+                    var uniqueTextChoices = (type === 'single' || type === 'multiple') && candidates.length === 1 && q.options.length >= 4 &&
+                        q.options.every(function (option) { return !!plainImageText(option.text) && !/\[图片:/.test(option.text); });
+                    var extraRecovery = uniqueTextChoices && hasExtraStemImages(q.stem, pageGroups.stem);
+                    // An image-only single-choice preview can omit formulas and
+                    // show stray fragments. At least one retained occurrence must match.
+                    var fragmentRecovery = uniqueTextChoices && type === 'single' && candidate.exactStem === false;
+                    if (type !== 'single' && type !== 'multiple' && type !== 'judge' ||
+                        !extraRecovery && !visibleStemSubset(q.stem, pageGroups.stem, fragmentRecovery)) {
+                        var storedCount = (q.stem.match(/\[图片:[^\]]+\]/g) || []).length;
+                        mismatch = storedCount !== pageGroups.stem.length ? '页面题干有 ' + pageGroups.stem.length + ' 张图片，题库有 ' + storedCount + ' 张，内容不一致' : '页面题干图片与题库内容不同';
+                        continue;
+                    }
+                    partial = true;
+                }
+                var raw = { type: type, needsReview: partial };
                 if (type === 'single' || type === 'multiple') {
                     if (q.options.length !== s.options.length) continue;
                     var mapping = {}, positions = new Set(), valid = true;
                     for (var o = 0; o < q.options.length; o++) {
                         var matches = [];
                         for (var k = 0; k < s.options.length; k++) {
-                            var label = String.fromCharCode(65 + k), pageText = s.options[k].replace(new RegExp('^\\s*' + label + '[.、．:：]\\s*'), '');
-                            if (plainImageText(q.options[o].text) === plainImageText(pageText) && await equalGroup(q.options[o].text, pageGroups[label])) matches.push(label);
+                            var label = String.fromCharCode(65 + k);
+                            if (plainImageText(q.options[o].text) === plainImageText(s.options[k]) && equalGroup(q.options[o].text, pageGroups[label])) matches.push(label);
                         }
                         if (matches.length !== 1 || positions.has(matches[0])) { valid = false; break; }
                         mapping[q.options[o].id] = matches[0]; positions.add(matches[0]);
                     }
-                    if (!valid) continue;
+                    if (!valid) { mismatch = '题干已匹配，但选项文字、图片归属不同或选项重复'; continue; }
                     raw.choices = q.answer.map(function (id) { return mapping[id]; }).sort();
                 } else if (type === 'judge') raw.answers = [q.answer ? '正确' : '错误'];
-                else if (type === 'blank') { if (q.answer.length !== s.blanks) continue; raw.answers = q.answer.map(function (variants) { return variants[0]; }); }
+                else if (type === 'blank') {
+                    if (q.answer.length !== s.blanks) { blankCountMismatch = true; continue; }
+                    raw.answers = q.answer.map(function (variants) { return variants[0]; });
+                }
                 else raw.answers = [q.answer];
-                if (/\[图片:[^\]]+\]/.test(JSON.stringify(raw))) continue;
-                if (candidate.conflict || accepted && JSON.stringify(accepted) !== JSON.stringify(raw)) return { matched: false, reason: 'ambiguous' };
-                accepted = raw; bank = candidate.bank;
+                if (candidate.conflict || accepted && (partial || accepted.needsReview || JSON.stringify(accepted) !== JSON.stringify(raw))) return { matched: false, reason: 'ambiguous' };
+                accepted = raw; selected = candidate;
             }
             if (!isCurrent(s) || controller.signal.aborted) throw fail('STALE', '题目已变化，图片结果不会填入');
-            return accepted ? { matched: true, answer: accepted, bank: bank + '（图片已核对）' } : { matched: false, reason: 'image-mismatch' };
+            if (accepted && accepted.answers && accepted.answers.some(function (text) { return /\[图片:[^\]]+\]/.test(text); }))
+                return { matched: false, reason: 'answer-image' };
+            var detail = damaged.length ? '候选题图无法读取：' + damaged.join('、') : '';
+            if (!accepted) return { matched: false, reason: blankCountMismatch ? 'blank-count-mismatch' : 'image-mismatch',
+                detail: detail || (candidates.length === 1 ? mismatch : '') };
+            if (damaged.length && accepted.needsReview) return { matched: false, reason: 'ambiguous', detail: detail };
+            if (damaged.length) accepted.needsReview = true;
+            return { matched: true, answer: accepted, detail: detail,
+                bank: selected.bank + (damaged.length ? '（另有题图无法读取，建议核对）' : accepted.needsReview ? '（部分题图匹配，建议核对）' : '（图片已核对）'),
+                matchedQuestion: { dbId: selected.dbId, bank: selected.bank, stem: selected.question.stem } };
         } finally { clearTimeout(timer); active.delete(controller); }
     }
     async function execute(s, c) {
         if (!isCurrent(s)) throw fail('STALE', '题目或配置已变化，旧结果不会填充');
         var bankMiss = false;
         if (!s.textMode && c.bankAnswerMode !== 'off') {
-            var local = await lookupBank(s);
-            if (local.candidates) local = await matchImageBank(s, c, local.candidates);
+            var local;
+            try {
+                for (var attempt = 0; attempt < 2; attempt++) {
+                    if (!isCurrent(s)) throw fail('STALE', '题目或配置已变化');
+                    local = await lookupBank(s);
+                    if (!local.candidates) break;
+                    var review = local.review, imageBytes = 0;
+                    try {
+                        for (var candidate of local.candidates) {
+                            if (!isCurrent(s)) throw fail('STALE', '题目或配置已变化');
+                            if (candidate.dbId) {
+                                var media = await bankRequest({ action: 'images', id: candidate.dbId, revision: local.revision, questionOnly: true }, 15000, true);
+                                candidate.question.images = media.images;
+                                imageBytes += JSON.stringify(media.images).length;
+                                if (imageBytes > 8 * 1024 * 1024) { local = { matched: false, reason: 'candidate-limit', review: review }; break; }
+                            }
+                        }
+                    } catch (error) {
+                        if (error.code === 'BANK_REVISION' && attempt === 0) continue;
+                        throw error;
+                    }
+                    if (local.candidates) {
+                        var bankDataRevision = local.revision;
+                        local = await matchImageBank(s, c, local.candidates);
+                        local.review = review; local.revision = bankDataRevision;
+                    }
+                    break;
+                }
+            } catch (error) {
+                if (isCurrent(s) && error.code !== 'CANCELED' && error.code !== 'STALE') recordBankReview(s, { reason: 'error', detail: error.message });
+                throw error;
+            }
             if (!isCurrent(s)) throw fail('STALE', '题目或设置已变化，题库答案不会填入');
+            recordBankReview(s, local);
             if (local.matched) {
-                var bankAnswer = validateAnswer(local.answer, s); bankAnswer.source = '本地题库 · ' + local.bank;
+                var bankAnswer = validateAnswer(local.answer, s, local.answer.type === 'text' ? 128000 : undefined);
+                bankAnswer.source = '本地题库 · ' + local.bank;
+                bankAnswer.bankDataRevision = local.revision;
                 bankAnswer.msg = '本地题库命中'; stats.status = 'ready'; stats.lastCode = null; return bankAnswer;
             }
             if (local.reason === 'ambiguous') throw fail('BANK_AMBIGUOUS', '题库答案有冲突或匹配不明确，已跳过');
-            if (c.bankAnswerMode === 'only' || !enabled()) throw fail('BANK_MISS', local.reason === 'image-mismatch' ? '题库图片与当前题图不一致，已跳过' : '本地题库未命中，已跳过');
+            if (local.reason === 'answer-image') throw fail('BANK_MISS', '题库答案含图片，已跳过');
+            if (c.bankAnswerMode === 'only' || !enabled()) {
+                var missMessages = { 'candidate-limit': '题库候选数量或图片数据过多，请缩小题库范围', 'image-mismatch': local.detail || '题库图片与当前题图不一致', 'options-mismatch': '题干已匹配，但选项内容不同或重复', 'blank-count-mismatch': '题干已匹配，但答案组数与可填写位置不一致' };
+                throw fail('BANK_MISS', (missMessages[local.reason] || '本地题库未找到对应题干') + '，已跳过');
+            }
             bankMiss = true;
         }
         if (!enabled()) throw fail('DISABLED', 'DeepSeek 已关闭');
         if (!c.apiKey) throw fail('NO_KEY', bankMiss ? '题库未命中，且未配置 DeepSeek Key，已跳过' : '未配置 API Key，请按 Ctrl+G');
+        if (s.images.length > c.maxImages) throw fail('IMAGE_LIMIT', '图片过多，请缩小到当前一道题');
         var target = endpoint(c), controller = new AbortController(), timedOut = false;
+        controller.answer = true;
+        controller.bankAnswer = s.bankRevision != null;
         active.add(controller);
         var timer = setTimeout(function () { timedOut = true; controller.abort(); }, c.timeoutMs);
         try {
@@ -779,7 +1121,7 @@
                     { role: 'user', content: s.textMode ? content : content.concat([{ type: 'text', text: schemaHint(s) }]) }
                 ] });
             if (body.length > 12 * 1024 * 1024) throw fail('IMAGE_LIMIT', '请求过大，请裁剪图片');
-            var key = revision + ':' + target + ':' + body, hit = cache.get(key);
+            var key = revision + ':' + bankMiss + ':' + target + ':' + body, hit = cache.get(key);
             if (hit && !(s.retry && hit.error) && Date.now() - hit.at < 10 * 60 * 1000) { stats.cacheHits++; if (hit.error) throw hit.error; return hit.value; }
             if (hit) { cache.delete(key); cacheBytes -= key.length * 2; }
             stats.status = 'requesting'; stats.images = s.images.length;
@@ -811,6 +1153,35 @@
             throw error;
         } finally { clearTimeout(timer); active.delete(controller); }
     }
+    function requireCurrentAnswer(s) {
+        var state = answerState(s);
+        if (state) throw fail(state, state === 'STALE_EDIT' ? '答题期间已手动修改，保留当前答案' : '题目或输入已变化，旧结果不会填充');
+    }
+    async function bankDataIsCurrent(expected) {
+        var result = await bankRequest({ action: 'revision' }, 15000, true);
+        return result.revision === expected;
+    }
+    async function executeWithLegacyFallback(s, c, data) {
+        try { return await execute(s, c); }
+        catch (error) {
+            if (['STALE', 'STALE_CANVAS', 'STALE_EDIT', 'CANCELED', 'DISABLED', 'NO_KEY'].indexOf(error.code) >= 0) throw error;
+            requireCurrentAnswer(s);
+            var boot = w.__cefUserScriptState;
+            if (!w.__cefLegacyQuestionLookup && boot && boot.promise) await boot.promise;
+            if (!w.__cefLegacyQuestionLookup) throw error;
+            requireCurrentAnswer(s);
+            var result;
+            try {
+                var raw = await w.__cefLegacyQuestionLookup({ stemNode: data.stemNode, options: s.options, type: s.type,
+                    optionNodes: [0, 1, 3, 66].indexOf(s.type) >= 0 ? data.$options : null });
+                if (raw) result = validateAnswer(raw, s);
+            } catch (_) { throw error; }
+            if (!result) throw error;
+            result.source = 'DeepSeek 未成功 → 万能脚本题库';
+            stats.status = 'ready'; stats.lastCode = null;
+            return result;
+        }
+    }
     function answer(data) {
         var s;
         try { s = snapshot(data); } catch (error) {
@@ -821,22 +1192,28 @@
             }
             notify(error); return Promise.reject(error);
         }
-        var c = cfg, key = revision + ':' + JSON.stringify([s.question, s.options, s.type, s.textMode, s.images.map(function (x) { return [x.label, x.src]; })]);
+        var c = cfg, legacyFallback = data.__cefAILegacyFallback === true && universalScriptAtStartup && c.mode === 'ai-first' &&
+            c.bankAnswerMode === 'off' && s.images.every(function (item) { return item.node && item.node.tagName === 'IMG'; });
+        data.__cefAIState = function () { return answerState(s); };
+        var key = revision + ':' + JSON.stringify([s.bankRevision, s.question, s.options, s.type, s.blanks, s.textMode, legacyFallback, s.images.map(function (x) { return [x.label, x.src, x.anchor]; })]);
         if (s.retry) blocked.delete(key);
         if (blocked.has(key)) { stats.cacheHits++; return Promise.reject(blocked.get(key)); }
         var task = pending.get(key);
         if (!task) {
-            task = schedule(function () { return execute(s, c); }); pending.set(key, task);
+            task = schedule(function () { return legacyFallback ? executeWithLegacyFallback(s, c, data) : execute(s, c); }, null, true); pending.set(key, task);
             task.then(function () { pending.delete(key); }, function () { pending.delete(key); });
         }
         return task.then(function (result) {
-            if (!isCurrent(s)) throw fail('STALE', '题目或输入已变化，旧结果不会填充');
-            data.__cefAI = true; data.__cefAIValidate = function () { return isCurrent(s); };
+            requireCurrentAnswer(s);
+            data.__cefAI = true; data.__cefAIValidate = function () { return !answerState(s); };
             return result;
         }).catch(function (error) {
+            if (error.code !== 'STALE_EDIT' && snapshotState(s) === 'STALE_EDIT')
+                error = fail('STALE_EDIT', '答题期间已手动修改，保留当前答案');
             // The legacy worker retries failed questions. Never turn that into
             // repeated billable requests after ambiguous network/timeout errors.
-            if (s.revision === revision && error.code !== 'STALE' && error.code !== 'CANCELED') {
+            if (s.revision === revision && (s.bankRevision == null || s.bankRevision === bankRevision) &&
+                ['STALE', 'STALE_CANVAS', 'STALE_EDIT', 'CANCELED'].indexOf(error.code) < 0) {
                 blocked.set(key, error);
                 while (blocked.size > 32) blocked.delete(blocked.keys().next().value);
             }
@@ -848,26 +1225,30 @@
         var data = Object.assign({}, context, { question: prompt, type: 4, __textMode: true });
         return answer(data).then(function (result) { context.validate = data.__cefAIValidate; return result; });
     }
-    function normalizeChatMessages(messages) {
+    function normalizeChatMessages(messages, maxImages) {
         if (!Array.isArray(messages) || !messages.length || messages.length > 20) throw fail('CHAT', '对话上下文必须为 1 到 20 条');
         var hasImage = false;
-        var normalized = messages.map(function (message) {
+        var normalized = messages.map(function (message, index) {
             if (!message || (message.role !== 'user' && message.role !== 'assistant')) throw fail('CHAT', '对话角色无效');
             if (typeof message.content === 'string') {
                 if (!message.content.trim() || message.content.length > 32000) throw fail('CHAT', '对话内容为空或过长');
                 return { role: message.role, content: message.content };
             }
-            if (message.role !== 'user' || !Array.isArray(message.content) || !message.content.length || message.content.length > 8)
+            var limit = index === messages.length - 1 ? maxImages : 12;
+            if (message.role !== 'user' || !Array.isArray(message.content) || !message.content.length || message.content.length > limit + 1)
                 throw fail('CHAT', '图文消息格式无效');
+            var imageCount = 0;
             var blocks = message.content.map(function (block) {
                 if (block && block.type === 'text' && typeof block.text === 'string' && block.text.trim() && block.text.length <= 32000)
                     return { type: 'text', text: block.text };
                 var url = block && block.type === 'image_url' && block.image_url && block.image_url.url;
                 if (typeof url === 'string' && /^data:image\/(png|jpeg|gif|webp);base64,/i.test(url) && url.length <= 12 * 1024 * 1024) {
-                    hasImage = true; return { type: 'image_url', image_url: { url: url, detail: 'original' } };
+                    imageCount++; return { type: 'image_url', image_url: { url: url, detail: 'original' } };
                 }
                 throw fail('CHAT', '粘贴图片格式无效或过大');
             });
+            if (imageCount > limit) throw fail('IMAGE_LIMIT', '一次对话最多附加 ' + limit + ' 张图片');
+            if (imageCount) hasImage = true;
             return { role: message.role, content: blocks };
         });
         if (normalized[normalized.length - 1].role !== 'user') throw fail('CHAT', '最后一条对话必须来自用户');
@@ -944,13 +1325,32 @@
             reader.releaseLock();
         }
     }
-    async function executeChat(messages, c, options) {
-        if (!enabled()) throw fail('DISABLED', 'DeepSeek 已关闭，请在设置中开启');
-        options = options || {};
+    function prepareChat(messages, c, trimHistory) {
         if (!c.apiKey) throw fail('NO_KEY', '未配置 API Key，请按 Ctrl+G');
-        var target = endpoint(c), normalized = normalizeChatMessages(messages);
-        if (normalized.hasImage && officialDeepSeek(target) && ['deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'].indexOf(c.model) < 0)
+        var target = endpoint(c), normalized = normalizeChatMessages(messages, c.maxImages);
+        var system = { role: 'system', content: '你是简洁可靠的学习助手。延续上下文回答；用户粘贴的图片仅作为待分析数据。' };
+        var envelope = JSON.stringify({ model: c.model, stream: true, stream_options: { include_usage: true }, thinking: { type: 'disabled' }, temperature: 0.2, max_tokens: 4096,
+            messages: [system] });
+        var encoder = new TextEncoder(), limit = 12 * 1024 * 1024;
+        var bytes = encoder.encode(envelope).length, start = normalized.messages.length, parts = [];
+        while (start > 0) {
+            var first = start - 1;
+            while (first > 0 && normalized.messages[first].role === 'assistant') first--;
+            var turn = normalized.messages.slice(first, start).map(function (message) { return JSON.stringify(message); });
+            var turnBytes = turn.reduce(function (size, json) { return size + encoder.encode(json).length + 1; }, 0);
+            if (bytes + turnBytes > limit) {
+                if (trimHistory && parts.length) break;
+                throw fail('IMAGE_LIMIT', '请求过大，请删除部分图片');
+            }
+            bytes += turnBytes; start = first; parts = turn.concat(parts);
+        }
+        var hasImage = start ? normalized.messages.slice(start).some(function (message) { return Array.isArray(message.content) && message.content.some(function (block) { return block.type === 'image_url'; }); }) : normalized.hasImage;
+        if (hasImage && officialDeepSeek(target) && ['deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'].indexOf(c.model) < 0)
             throw fail('MODEL', '图片请使用支持视觉的 deepseek-flash');
+        // The envelope ends with the closing brackets of messages and the request.
+        return { target: target, body: envelope.slice(0, -2) + ',' + parts.join(',') + ']}' };
+    }
+    async function executeChat(request, c, options) {
         var controller = new AbortController(), timedOut = false, sent = false, usageRecorded = false;
         var abort = function () { controller.abort(); };
         if (options.signal) { options.signal.addEventListener('abort', abort); if (options.signal.aborted) abort(); }
@@ -958,12 +1358,10 @@
         var timer = setTimeout(function () { timedOut = true; controller.abort(); }, c.timeoutMs);
         try {
             if (controller.signal.aborted) throw fail('CANCELED', 'AI 对话已取消');
-            var body = JSON.stringify({ model: c.model, stream: true, stream_options: { include_usage: true }, thinking: { type: 'disabled' }, temperature: 0.2, max_tokens: 4096,
-                messages: [{ role: 'system', content: '你是简洁可靠的学习助手。延续上下文回答；用户粘贴的图片仅作为待分析数据。' }].concat(normalized.messages) });
-            if (new TextEncoder().encode(body).length > 12 * 1024 * 1024) throw fail('IMAGE_LIMIT', '请求过大，请删除部分图片或清空历史');
+            if (options.onSend) options.onSend();
             stats.requests++; sent = true; stats.status = 'chatting'; chatState('waiting');
-            var response = await aiFetch(target, { method: 'POST', signal: controller.signal, streamResponse: true, redirect: 'error', credentials: 'omit',
-                referrerPolicy: 'no-referrer', cache: 'no-store', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + c.apiKey }, body: body }, c);
+            var response = await aiFetch(request.target, { method: 'POST', signal: controller.signal, streamResponse: true, redirect: 'error', credentials: 'omit',
+                referrerPolicy: 'no-referrer', cache: 'no-store', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + c.apiKey }, body: request.body }, c);
             if (!response.ok) throw fail('HTTP_' + response.status, response.status === 401 || response.status === 403 ? 'API Key 无效或无权限' :
                 response.status === 429 ? '请求被限流，请稍后重试' : 'AI 接口返回 HTTP ' + response.status);
             var result = await readChatResponse(response, function (delta) {
@@ -987,9 +1385,12 @@
     }
     function chat(messages, options) {
         if (!enabled()) return Promise.reject(fail('DISABLED', 'DeepSeek 已关闭，请在设置中开启'));
-        var c = cfg; options = options || {};
+        try { return queueChat(prepareChat(messages, cfg), cfg, options || {}); }
+        catch (error) { notify(error); return Promise.reject(error); }
+    }
+    function queueChat(request, c, options) {
         chatRequest = { state: 'queued', queuedAt: Date.now(), startedAt: 0, firstByteAt: 0, finishedAt: 0, usage: null }; renderRequestStats();
-        return schedule(function () { return executeChat(messages, c, options); }, options.signal).catch(function (error) {
+        return schedule(function () { return executeChat(request, c, options); }, options.signal).catch(function (error) {
             chatState(error.code === 'CANCELED' ? 'canceled' : 'failed'); if (error.code !== 'CANCELED') notify(error); throw error;
         });
     }
@@ -1029,18 +1430,26 @@
     function fillText(node, value) {
         if (!node) return false;
         var input = /^(INPUT|TEXTAREA)$/.test(node.tagName) ? node : node.querySelector('textarea:not([hidden]),input[type=text],input:not([type])');
-        if (input && (input.hidden || input.style.display === 'none' || input.getAttribute('type') === 'hidden')) input = null;
+        if (input && (!input.getClientRects().length || input.type === 'hidden')) input = null;
         if (input && input.tagName === 'INPUT' && !/^(text|search|email|url|tel|number)$/.test(input.type)) input = null;
         if (input && !input.readOnly && !input.disabled && !input.value) {
             var proto = input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            var expected = input.tagName === 'TEXTAREA' ? String(value).replace(/\r\n?/g, '\n') : String(value);
             var setter = Object.getOwnPropertyDescriptor(proto, 'value').set; setter.call(input, value);
-            input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); return true;
+            if (input.value !== expected) { setter.call(input, ''); return false; }
+            input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true }));
+            return input.value === expected;
+        }
+        function fillEditable(editor) {
+            if (!editor || !editor.getClientRects().length || editor.textContent.trim() || editor.querySelector('img,canvas,svg,video,iframe')) return false;
+            editor.textContent = value; editor.dispatchEvent(new Event('input', { bubbles: true })); return editor.textContent === String(value);
         }
         var editable = node.isContentEditable ? node : node.querySelector('[contenteditable=true]');
-        if (editable && !editable.textContent.trim()) { editable.textContent = value; editable.dispatchEvent(new Event('input', { bubbles: true })); return true; }
+        if (fillEditable(editable)) return true;
         var frames = node.tagName === 'IFRAME' ? [node] : node.querySelectorAll('iframe');
         for (var i = 0; i < frames.length; i++) {
-            try { var body = frames[i].contentDocument.body; if (body && (body.isContentEditable || body.querySelector('[contenteditable=true]')) && !body.textContent.trim()) { body.textContent = value; body.dispatchEvent(new Event('input', { bubbles: true })); return true; } } catch (_) { /* Cross-origin editor requires manual confirmation. */ }
+            var frameDoc = frames[i].getClientRects().length && frames[i].contentDocument, body = frameDoc && frameDoc.body;
+            if (body && fillEditable(body.isContentEditable || frameDoc.designMode === 'on' ? body : body.querySelector('[contenteditable=true]'))) return true;
         }
         return false;
     }
@@ -1077,8 +1486,7 @@
             if (opacitySavedRevision >= attempted) return;
             // Only update this preference on the last confirmed disk config.
             // Never save a draft Key/model/enable checkbox as a side effect.
-            var next = normalize(Object.assign({}, diskConfig, pendingPreferences));
-            await writeConfigNow(next);
+            await writeConfigNow(pendingPreferences);
         }).catch(function (error) {
             opacitySaveStatus('未保存', error.message || '无法保存透明度，请检查 DLL 配置通道');
         }).finally(function () {
@@ -1088,6 +1496,7 @@
         return opacityJob;
     }
     var chatHistory = [], chatImages = [], chatBusy = false, chatController = null, captureCancel = null;
+    var chatPasteJob = null, chatDraftVersion = 0;
     var chatViews = new WeakMap(), renderedChatImages = [];
     var chatRenderPending = false, chatRenderFrame = null, chatRenderTimer = null, chatRenderEpoch = 0;
     function cancelChatRender() {
@@ -1238,40 +1647,67 @@
         if (changed && follow) log.scrollTop = log.scrollHeight;
         updateChatLatest();
     }
-    async function sendChatMessage() {
+    async function sendChatMessage(selection) {
         if (!dialog || chatBusy) return;
+        var selectionOnly = typeof selection === 'string', draftVersion = chatDraftVersion;
+        if (!selectionOnly) {
+            while (chatPasteJob) {
+                if (!await chatPasteJob || chatBusy || draftVersion !== chatDraftVersion) return;
+            }
+        }
         if (!enabled()) { reportStatus('DeepSeek 已关闭，请在设置中开启', 'error'); dialog.panel.getElementById('tabSettings').click(); return; }
-        var input = dialog.panel.getElementById('chatInput'), text = input.value.trim();
-        if (!text && !chatImages.length) return;
+        var input = dialog.panel.getElementById('chatInput'), text = (selectionOnly ? selection : input.value).trim();
+        var images = selectionOnly ? [] : chatImages.slice();
+        if (!text && !images.length) return;
         if (!text) text = '请分析这张图片。';
-        var draft = { images: chatImages.slice(), history: chatHistory.filter(function (m) { return !m.failed && !m.pending; }).map(function (m) { return { role: m.role, content: m.content }; }) }, content = draft.images.length ? [{ type: 'text', text: text }].concat(draft.images.map(function (url) { return { type: 'image_url', image_url: { url: url } }; })) : text;
-        var user = { role: 'user', content: content, display: text + (draft.images.length ? '  [图片 ' + draft.images.length + ' 张]' : '') };
+        var history = chatHistory.filter(function (m) { return !m.failed && !m.pending; }).map(function (m) { return { role: m.role, content: m.content }; });
+        var content = images.length ? [{ type: 'text', text: text }].concat(images.map(function (url) { return { type: 'image_url', image_url: { url: url } }; })) : text;
+        var user = { role: 'user', content: content, display: text + (images.length ? '  [图片 ' + images.length + ' 张]' : '') };
         var reply = { role: 'assistant', content: '', display: '', pending: true };
-        var messages = draft.history.concat([{ role: 'user', content: content }]);
+        var messages = history.concat([{ role: 'user', content: content }]);
+        var c = cfg, request, sent = false;
+        try { request = prepareChat(messages, c, true); }
+        catch (error) { notify(error); return; }
         chatHistory.push(user, reply); while (chatHistory.length > 18) chatHistory.shift();
-        input.value = ''; chatImages = []; chatBusy = true; chatController = new AbortController(); renderChat();
+        if (!selectionOnly) { input.value = ''; chatImages = []; }
+        chatBusy = true; chatController = new AbortController(); renderChat();
         try {
-            var answerText = await chat(messages, { signal: chatController.signal, onDelta: function (delta) { reply.content += delta; reply.display = reply.content; queueChatRender(); } });
+            var answerText = await queueChat(request, c, { signal: chatController.signal, onSend: function () { sent = true; },
+                onDelta: function (delta) { reply.content += delta; reply.display = reply.content; queueChatRender(); } });
             reply.content = answerText; reply.display = answerText;
         } catch (error) {
-            reply.failed = true; reply.note = error.code === 'CANCELED' ? '已停止 · 不保证服务端停止计费' : '请求失败：' + (error.message || '未知错误');
+            if (!sent) user.failed = true;
+            reply.failed = true;
+            reply.note = error.code === 'CANCELED' ? (sent ? '已停止 · 不保证服务端停止计费' : '已取消发送') : '请求失败：' + (error.message || '未知错误');
             if (!reply.content) reply.display = reply.note;
         } finally { reply.pending = false; chatBusy = false; chatController = null; renderChat(); input.focus(); }
     }
     function stopChat() { if (chatController) { chatController.abort(); chatState('canceled'); renderChat(); } }
-    async function captureChatPaste(event) {
+    function captureChatPaste(event) {
         var data = event.clipboardData, files = [];
         if (!data || !data.items) return;
         Array.prototype.forEach.call(data.items, function (item) { if (item.kind === 'file' && /^image\//i.test(item.type)) { var file = item.getAsFile(); if (file) files.push(file); } });
         if (!files.length) return;
+        var pastedText = data.getData('text/plain');
         event.preventDefault();
+        if (pastedText) event.currentTarget.setRangeText(pastedText, event.currentTarget.selectionStart, event.currentTarget.selectionEnd, 'end');
         if (chatImages.length + files.length > cfg.maxImages) { notify(fail('IMAGE_LIMIT', '一次对话最多附加 ' + cfg.maxImages + ' 张图片')); return; }
-        try {
-            for (var i = 0; i < files.length; i++) chatImages.push(await normalizeImage(files[i], cfg));
-            var pastedText = data.getData('text/plain');
-            if (pastedText && dialog) { var input = dialog.panel.getElementById('chatInput'), start = input.selectionStart == null ? input.value.length : input.selectionStart; input.value = input.value.slice(0, start) + pastedText + input.value.slice(input.selectionEnd == null ? start : input.selectionEnd); }
-            renderChat(); reportStatus('已粘贴图片，发送前可预览或移除', 'success');
-        } catch (error) { notify(error); }
+        var previous = chatPasteJob, version = chatDraftVersion;
+        var job = (async function () {
+            var previousOk = !previous || await previous;
+            if (version !== chatDraftVersion) return false;
+            try {
+                var images = [];
+                for (var i = 0; i < files.length; i++) images.push(await normalizeImage(files[i], cfg));
+                if (version !== chatDraftVersion) return false;
+                if (chatImages.length + images.length > cfg.maxImages) throw fail('IMAGE_LIMIT', '一次对话最多附加 ' + cfg.maxImages + ' 张图片');
+                chatImages.push.apply(chatImages, images);
+                renderChat(); reportStatus('已粘贴图片，发送前可预览或移除', 'success');
+                return previousOk;
+            } catch (error) { if (version === chatDraftVersion) notify(error); return false; }
+        })();
+        chatPasteJob = job;
+        job.then(function () { if (chatPasteJob === job) chatPasteJob = null; });
     }
     function hotkeyField() {
         var el = dialog && dialog.panel.activeElement;
@@ -1287,9 +1723,15 @@
         var result = {}; Object.keys(defaultHotkeys).forEach(function (name) { result[name] = dialog.panel.querySelector('[data-hotkey="' + name + '"]').value; });
         return normalizeHotkeys(result);
     }
-    function loadHotkeyFields() {
-        if (!dialog) return;
-        Object.keys(defaultHotkeys).forEach(function (name) { dialog.panel.querySelector('[data-hotkey="' + name + '"]').value = cfg.hotkeys[name]; });
+    function syncDraftField(field, value) {
+        value = String(value);
+        if (!formBaselines.has(field) || field.value === formBaselines.get(field)) field.value = value;
+        formBaselines.set(field, value);
+    }
+    function syncPanelFields() {
+        var fields = { base: cfg.baseUrl, model: cfg.model, mode: cfg.mode, answerDelay: cfg.answerDelayMs / 1000, overwritePolicy: cfg.overwritePolicy };
+        Object.keys(fields).forEach(function (id) { syncDraftField(dialog.panel.getElementById(id), fields[id]); });
+        Object.keys(defaultHotkeys).forEach(function (name) { syncDraftField(dialog.panel.querySelector('[data-hotkey="' + name + '"]'), cfg.hotkeys[name]); });
     }
     function renderHotkeyHints() {
         if (!dialog) return;
@@ -1333,17 +1775,18 @@
         if (!/^[a-f0-9]{32}$/.test(token) || combo !== cfg.hotkeys.selection) return;
         selectionPermit = { token: token, until: Date.now() + 3000 }; acceptNativeSelection();
     }
-    function selectedText(view) {
+    function selectedText(view, strictControl) {
         view = view || w;
         try {
             var el = view.document.activeElement;
             for (var depth = 0; el && el.shadowRoot && el.shadowRoot.activeElement && depth < 8; depth++) el = el.shadowRoot.activeElement;
             if (el && /^(INPUT|TEXTAREA)$/.test(el.tagName)) {
                 if (el.type === 'password') return '';
-                if (typeof el.selectionStart === 'number' && el.selectionEnd > el.selectionStart) return el.value.slice(el.selectionStart, el.selectionEnd);
+                if (typeof el.selectionStart === 'number' && (strictControl || el.selectionEnd > el.selectionStart))
+                    return el.value.slice(el.selectionStart, el.selectionEnd);
             }
             var text = String(view.getSelection() || '');
-            if (!text && el && /^(IFRAME|FRAME)$/.test(el.tagName)) return selectedText(el.contentWindow);
+            if (!text && el && /^(IFRAME|FRAME)$/.test(el.tagName)) return selectedText(el.contentWindow, strictControl);
             return text;
         } catch (_) { return ''; }
     }
@@ -1352,14 +1795,14 @@
         text = typeof text === 'string' ? text : selectedText();
         openSettings(); dialog.panel.getElementById('tabChat').click();
         if (!text.trim()) { chatState('idle'); reportStatus('请先选择文字，再按 ' + cfg.hotkeys.selection, 'error'); return false; }
-        var input = dialog.panel.getElementById('chatInput'), savedText = input.value, savedImages = chatImages;
-        input.value = text.slice(0, 32000);
+        var input = dialog.panel.getElementById('chatInput');
+        text = text.slice(0, 32000);
         if (autoSend) {
             // This shortcut sends only the explicit selection, never unrelated
             // attachments left in a draft. Restore that draft while generating.
-            chatImages = []; reportStatus('正在发送选中文字…', ''); sendChatMessage();
-            input.value = savedText; chatImages = savedImages; renderChat();
-        } else reportStatus('已带入选中文字，编辑后点击发送', 'success'); return true;
+            reportStatus('正在发送选中文字…', ''); sendChatMessage(text);
+        } else { input.value = text; reportStatus('已带入选中文字，编辑后点击发送', 'success'); }
+        return true;
     }
     async function captureRegion() {
         if (captureCancel || chatBusy) return;
@@ -1447,6 +1890,7 @@
     }
     function hideSettings() {
         if (!dialog) return;
+        if (captureCancel) captureCancel();
         rememberBounds(); flushOpacitySave();
         stopDrag(); dialog.panel.getElementById('key').value = ''; dialog.host.style.display = 'none';
         if (priorFocus && priorFocus.isConnected && priorFocus.focus) { try { priorFocus.focus({ preventScroll: true }); } catch (_) {} }
@@ -1470,131 +1914,498 @@
     }
     function installQuestionBank(panel) {
         function field(id) { return panel.getElementById(id); }
-        var busy = false, connected = false, importWarnings = [];
+        var busy = false, connected = false, pendingImport = null, importWarnings = [], importIssues = [], locations = [];
+        var cursor = 0, cursors = [0], pageIndex = 0, more = false, conflictCursor = 0, conflictMore = false;
+        var searchFilters = null, previewState = null, currentView = 'browse';
+        var reviewRows = new WeakMap(), detailVersions = new Map();
+        var conflictDrafts = new Map(), conflictDraftReaders = new WeakMap();
+        var conflictListRevision = null, conflictListBank = '', conflictLoadPending = false;
+        var typeNames = { single: '单选', multiple: '多选', boolean: '判断', blank: '填空', text: '简答' };
+        var reasons = { matched: '本地命中', 'needs-review': '需人工核对', 'not-found': '题干未命中', 'options-mismatch': '选项不同或重复',
+            'blank-count-mismatch': '填空数量不一致', 'image-mismatch': '图片不一致', 'answer-image': '答案含图片', ambiguous: '答案冲突或不明确', 'candidate-limit': '候选过多', error: '查询失败' };
+        field('bankPane').innerHTML =
+            '<p id="bankSummary" class="bank-summary">正在读取默认题库…</p><p id="bankPath" class="note"></p>' +
+            '<div class="bank-nav" role="group" aria-label="题库功能"><button id="bankBrowseTab">浏览</button><button id="bankImportTab">导入</button><button id="bankConflictTab">冲突</button><button id="bankReviewTab">核对</button></div>' +
+            '<p id="bankStatus" class="note" role="status" aria-live="polite"></p>' +
+            '<div id="bankBrowseView"><label class="field">题库分类<select id="bankFilter" class="control"><option value="">全部题库</option></select></label>' +
+            '<div class="bank-filter-grid"><label class="field">题型<select id="bankType" class="control"><option value="">全部题型</option><option value="single">单选</option><option value="multiple">多选</option><option value="boolean">判断</option><option value="blank">填空</option><option value="text">简答</option></select></label>' +
+            '<label class="field">标签（完整名称）<input id="bankTag" class="control" maxlength="256" placeholder="不限标签"></label></div>' +
+            '<label class="field">搜索题干<input id="bankQuery" class="control" maxlength="512" placeholder="关键词，留空浏览全部"></label><button id="bankSearch">查询题库</button>' +
+            '<div id="bankResults"></div><div class="bank-nav"><button id="bankPrev" disabled>上一页</button><span id="bankPage" class="note">第 1 页</span><button id="bankNext" disabled>下一页</button></div>' +
+            '<details><summary>题库答题设置</summary><label class="field">匹配范围<select id="bankScope" class="control"><option value="">全部题库</option></select></label>' +
+            '<label class="field">题库答题<select id="bankAnswerMode" class="control"><option value="off">关闭题库答题</option><option value="only">仅本地题库</option><option value="first">题库优先，未命中再用 DeepSeek</option></select></label><button id="bankStart">开始题库答题</button><p class="note">浏览筛选与匹配范围分别设置。冲突和不明确的结果跳过；匹配结果在“核对”中查看。</p></details></div>' +
+            '<div id="bankImportView" hidden><label class="field">导入格式<select id="bankImportFormat" class="control"><option value="docx">Word 文档（.docx）</option><option value="json">JSON 文件（.json）</option></select></label>' +
+            '<button id="bankImport">导入 Word 题库</button><input id="bankFile" type="file" accept=".docx" hidden><p class="note">最多 8 MiB、10000 道题。先预览检查，确认后整批写入；有错误时不会导入。</p>' +
+            '<div id="bankPreview"></div><div class="bank-nav"><button id="bankConfirm" disabled>确认导入</button><button id="bankCancelImport" disabled>取消预览</button><button id="bankErrorExport" disabled>下载问题清单</button></div></div>' +
+            '<div id="bankConflictView" hidden><label class="field">题库分类<select id="bankConflictFilter" class="control"><option value="">全部题库</option></select></label><button id="bankConflictRefresh">刷新冲突</button><p class="note">逐条对比后保留原题、采用新题或手动修正。同题其他冲突仍需分别处理。</p><div id="bankConflicts"></div><button id="bankConflictMore" disabled>加载更多冲突</button></div>' +
+            '<div id="bankReviewView" hidden><label class="field">匹配结果<select id="bankReviewFilter" class="control"><option value="">全部结果</option><option value="attention">仅需核对或未命中</option><option value="matched">本地命中</option><option value="needs-review">需人工核对</option><option value="not-found">题干未命中</option><option value="options-mismatch">选项不同</option><option value="blank-count-mismatch">空数不同</option><option value="image-mismatch">图片不同</option><option value="ambiguous">答案冲突</option><option value="candidate-limit">候选过多</option><option value="error">查询失败</option></select></label><button id="bankReviewClear">清空核对记录</button><p class="note">保留本页面最近 100 题的匹配记录，不代表已填写或已提交。候选详情读取当前题库；记录本身不会自动修改答案。</p><div id="bankReviews"></div></div>';
+        var style = doc.createElement('style');
+        style.textContent = '.bank-filter-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}#bankPane .control{min-width:0}.bank-nav{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0}.bank-nav button{flex:1;white-space:nowrap;padding:6px}.bank-nav button[data-active=true]{background:#eef2f7;color:#334155}#bankPane>[hidden]{display:none!important}#bankPane pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;max-height:280px;overflow:auto;background:#f8fafc;padding:8px;border-radius:6px}#bankStatus{white-space:pre-wrap;margin-bottom:12px}#bankStatus[data-state=error],.bank-issue{color:#b45353}#bankPane textarea{width:100%;min-height:190px;box-sizing:border-box;font-family:monospace;font-size:11px}#bankPane .bank-answer{white-space:pre-wrap;overflow-wrap:anywhere}#bankPane summary{overflow-wrap:anywhere;line-height:1.6}#bankPane img{max-width:100%;height:auto}#bankPreview ol{padding-left:22px;font-size:12px;line-height:1.7}';
+        style.textContent += '#bankPane fieldset{min-width:0;margin:10px 0;padding:8px;border:1px solid #e2e8f0;border-radius:6px}#bankPane legend{color:#475569;padding:0 4px}';
+        panel.appendChild(style);
         function message(text, error) { field('bankStatus').textContent = text; field('bankStatus').setAttribute('data-state', error ? 'error' : ''); }
+        function node(parent, tag, text, className) { var el = doc.createElement(tag); if (text != null) el.textContent = text; if (className) el.className = className; parent.appendChild(el); return el; }
+        function button(parent, text, action) { var el = node(parent, 'button', text); el.type = 'button'; el.onclick = action; return el; }
+        function request(action, values) {
+            if (!w.__cefNativeAiProxy || !w.__cefNativeAiProxy.questionBank) return Promise.reject(new Error('请更新 DLL 并重启客户端后使用题库'));
+            return bankRequest(Object.assign({ action: action }, values || {}));
+        }
         function controls() {
-            ['bankImport', 'bankImportFormat', 'bankSearch', 'bankStart'].forEach(function (id) { field(id).disabled = busy || !connected; });
-            field('bankQuery').disabled = busy || !connected;
+            ['bankImport', 'bankImportFormat', 'bankSearch', 'bankStart', 'bankFilter', 'bankType', 'bankTag', 'bankQuery', 'bankConflictRefresh', 'bankConflictFilter', 'bankScope', 'bankAnswerMode'].forEach(function (id) { field(id).disabled = busy || !connected; });
+            field('bankPrev').disabled = busy || !connected || pageIndex === 0;
+            field('bankNext').disabled = busy || !connected || !more;
+            field('bankConflictMore').disabled = busy || !connected || !conflictMore;
+            field('bankConfirm').disabled = busy || !connected || !pendingImport || !previewState || !previewState.valid || importIssues.length > 0;
+            field('bankCancelImport').disabled = busy || !pendingImport && !previewState;
+            field('bankErrorExport').disabled = busy || !importIssues.length && !importWarnings.length;
+        }
+        async function operation(run) {
+            if (busy) return;
+            busy = true; controls();
+            try { await run(); } catch (error) { message(error.message || '题库操作失败', true); }
+            finally {
+                busy = false; controls();
+                var load = conflictLoadPending; conflictLoadPending = false;
+                if (load && currentView === 'conflict') ensureConflicts();
+            }
         }
         function update(state) {
             connected = state.connected === true;
-            field('bankSummary').textContent = connected ? '默认题库 · ' + state.count + ' 道题 · ' + state.conflicts + ' 条冲突记录' : '默认题库尚未就绪';
+            field('bankSummary').textContent = connected ? state.count + ' 道题 · ' + state.conflicts + ' 条待处理冲突' : '默认题库尚未就绪';
             field('bankPath').textContent = connected ? state.path : '默认位置：' + (state.defaultPath || 'DLL 所在目录');
+            ['bankFilter', 'bankConflictFilter', 'bankScope'].forEach(function (id) {
+                var select = field(id), value = id === 'bankScope' ? cfg.bankScope : select.value;
+                select.textContent = ''; node(select, 'option', '全部题库').value = '';
+                (state.banks || []).forEach(function (bank) { node(select, 'option', bank.name + '（' + bank.count + '）').value = bank.name; });
+                if (value && !Array.prototype.some.call(select.options, function (option) { return option.value === value; })) node(select, 'option', value + '（当前不存在）').value = value;
+                select.value = value;
+            });
             if (state.connectionError) message(state.connectionError, true);
             controls();
         }
-        function request(action, values) {
-            if (!w.__cefNativeAiProxy || !w.__cefNativeAiProxy.questionBank) return Promise.reject(new Error('请先替换支持 SQLite 题库的 DLL，再重启客户端'));
-            return new Promise(function (resolve, reject) {
-                var xhr = new XMLHttpRequest();
-                xhr.open('POST', new URL('/__cef_cx_ai_proxy__/question-bank', w.location.origin).href, true);
-                xhr.timeout = 120000;
-                xhr.setRequestHeader('Content-Type', 'application/json'); xhr.setRequestHeader('X-Cef-Cx-Question-Bank', '1');
-                xhr.onload = function () {
-                    try {
-                        var result = JSON.parse(xhr.responseText);
-                        if (xhr.status !== 200 || result.ok !== true) throw new Error(result.error || '本地题库请求失败');
-                        resolve(result);
-                    } catch (error) { reject(error); }
-                };
-                xhr.onerror = function () { reject(new Error('无法连接本地题库通道，请确认在支持的客户端页面中打开面板')); };
-                xhr.ontimeout = function () { reject(new Error('题库操作超时，请重新打开题库页查看状态后再操作')); };
-                xhr.onabort = function () { reject(new Error('题库操作已取消')); };
-                xhr.send(JSON.stringify(Object.assign({ action: action }, values || {})));
+        function changed(state) {
+            update(state); more = false; pageIndex = 0; cursors = [0]; searchFilters = null; field('bankResults').textContent = ''; field('bankPage').textContent = '第 1 页';
+            if (state.importConflicts && currentView === 'conflict') conflictLoadPending = true;
+            if (cfg.bankAnswerMode !== 'off') refreshBankAnswers();
+        }
+        function detailVersion(id) { return detailVersions.get(id) || 0; }
+        function invalidateQuestionDetails(id) {
+            detailVersions.set(id, detailVersion(id) + 1);
+            panel.querySelectorAll('details[data-bank-question="' + id + '"]').forEach(function (card) { card.open = false; });
+        }
+        function answerText(q) {
+            if (q.type === 'boolean') return q.answer ? '正确' : '错误';
+            if (q.type === 'single' || q.type === 'multiple') return (q.answer || []).map(function (id) { var option = (q.options || []).find(function (o) { return o.id === id; }); return id + (option ? '. ' + option.text : ''); }).join('\n');
+            if (q.type === 'blank') return (q.answer || []).map(function (variants, i) { return '第 ' + (i + 1) + ' 空：' + variants.join(' / '); }).join('\n');
+            return String(q.answer == null ? '' : q.answer);
+        }
+        function showImages(parent, images) {
+            (images || []).forEach(function (media) {
+                node(parent, 'div', '[图片:' + media.id + ']', 'note');
+                var image = node(parent, 'img'); image.src = media.dataUrl; image.alt = media.id; image.loading = 'lazy';
             });
         }
-        async function run(action, values) {
-            if (busy) return;
-            busy = true; controls();
-            message(action === 'import' ? '正在导入，请稍候…' : '正在处理…');
-            try {
-                var result = await request(action, values);
-                if (action === 'search') {
-                    renderResults(result.questions || []);
-                    message('显示 ' + result.questions.length + ' 道题' + (result.more ? '，还有更多结果，请缩小关键词范围' : ''));
-                } else {
-                    update(result);
-                    if (action === 'import') {
-                        clear('题库内容已变化');
-                        if (connected && cfg.bankAnswerMode !== 'off') doc.dispatchEvent(new CustomEvent('cef-ai-config-changed'));
-                    }
-                    if (action !== 'status') field('bankResults').textContent = '';
-                    if (action === 'import') message('导入完成：新增 ' + result.inserted + '，重复跳过 ' + result.duplicates + '，冲突保留 ' + result.importConflicts + (importWarnings.length ? '\n需核对：\n' + importWarnings.join('\n') : ''));
-                    else if (!result.connectionError) message(result.connected ? '默认题库已就绪，导入数据后即可使用' : '默认题库尚未就绪，请检查目录写入权限');
-                }
-            } catch (error) { message(error.message || '题库操作失败', true); }
-            finally { busy = false; controls(); }
-        }
-        function renderResults(questions) {
-            var root = field('bankResults'); root.textContent = '';
-            questions.forEach(function (q) {
-                var item = doc.createElement('details'), title = doc.createElement('summary'), meta = doc.createElement('div');
-                item.className = 'bank-result'; title.textContent = q.stem; item.appendChild(title);
-                meta.className = 'note'; meta.textContent = q.bank + ' · ' + ({ single: '单选', multiple: '多选', boolean: '判断', blank: '填空', text: '简答' }[q.type] || q.type); item.appendChild(meta);
-                (q.options || []).forEach(function (option) { var row = doc.createElement('div'); row.textContent = option.id + '. ' + option.text; item.appendChild(row); });
-                var answer = doc.createElement('div'); answer.className = 'bank-answer';
-                var value = q.answer;
-                if (q.type === 'boolean') value = value ? '正确' : '错误';
-                else if (q.type === 'single' || q.type === 'multiple') value = value.map(function (id) { var option = q.options.find(function (o) { return o.id === id; }); return id + (option ? '. ' + option.text : ''); }).join('\n');
-                else if (q.type === 'blank') value = value.map(function (variants, index) { return '第 ' + (index + 1) + ' 空：' + variants.join(' / '); }).join('\n');
-                answer.textContent = '答案：\n' + String(value); item.appendChild(answer);
-                if (q.explanation) { var explanation = doc.createElement('div'); explanation.className = 'bank-answer'; explanation.textContent = '解析：\n' + q.explanation; item.appendChild(explanation); }
-                if (q.source) { var source = doc.createElement('div'); source.className = 'note'; source.textContent = '来源：' + q.source; item.appendChild(source); }
-                (q.images || []).forEach(function (image) {
-                    var figure = doc.createElement('div'), caption = doc.createElement('div'), picture = doc.createElement('img');
-                    caption.textContent = '[图片:' + image.id + ']'; caption.className = 'note'; picture.src = image.dataUrl; picture.alt = image.id;
-                    picture.style.cssText = 'display:block;max-width:100%;height:auto;margin:5px 0';
-                    figure.appendChild(caption); figure.appendChild(picture); item.appendChild(figure);
+        function showQuestion(parent, q, loadImages) {
+            node(parent, 'div', q.stem, 'bank-answer');
+            node(parent, 'div', (q.bank || '') + ' · ' + (typeNames[q.type] || q.type) + ((q.tags || []).length ? ' · ' + q.tags.join(' / ') : ''), 'note');
+            (q.options || []).forEach(function (option) { node(parent, 'div', option.id + '. ' + option.text, 'bank-answer'); });
+            node(parent, 'div', '答案：\n' + answerText(q), 'bank-answer');
+            if (q.explanation) node(parent, 'div', '解析：\n' + q.explanation, 'bank-answer');
+            if (q.source) node(parent, 'div', '来源：' + q.source, 'note');
+            if (q.images) showImages(parent, q.images);
+            else if (q.imageCount && loadImages) {
+                var load = button(parent, '加载 ' + q.imageCount + ' 张图片', async function () {
+                    load.disabled = true;
+                    try { await loadImages(); }
+                    catch (error) { message(error.message, true); load.disabled = false; }
                 });
-                root.appendChild(item);
+            }
+        }
+        function questionCard(root, q, compare) {
+            var item = node(root, 'details', null, 'bank-result');
+            item.setAttribute('data-bank-question', q.dbId);
+            function summaryText(question) {
+                return (q.matched ? '命中 · ' : '') + ((question.stem || '').slice(0, 600) || '图片题') +
+                    ' · ' + question.bank + (question.imageCount ? ' · ' + question.imageCount + ' 图' : '');
+            }
+            var summary = node(item, 'summary', summaryText(q));
+            var body = node(item, 'div'), loaded = -1, loading = false, imagesLoaded = false;
+            async function load(includeImages, version) {
+                var result = await request('detail', { id: q.dbId, images: includeImages });
+                if (version !== detailVersion(q.dbId)) return false;
+                summary.textContent = summaryText(result.question);
+                body.textContent = '';
+                if (compare) {
+                    node(body, 'div', '页面快照：' + compare.options.length + ' 个选项 / ' + compare.imageCount + ' 张图片' + (compare.blanks != null ? ' / ' + compare.blanks + ' 个空' : ''), 'note');
+                    node(body, 'div', '题库：' + result.question.options.length + ' 个选项 / ' + result.question.imageCount + ' 张附件（含解析图）' + (result.question.type === 'blank' ? ' / ' + result.question.answer.length + ' 组填空答案' : ''), 'note');
+                    var storedOptions = result.question.options.map(function (option) { return bankMatchText(option.text); });
+                    compare.options.forEach(function (text) {
+                        node(body, 'div', (storedOptions.indexOf(bankMatchText(text)) >= 0 ? '✓ ' : '≠ ') + text, 'bank-answer');
+                    });
+                    node(body, 'p', '题库当前内容', 'note');
+                }
+                showQuestion(body, result.question, function () { return load(true, version); });
+                imagesLoaded = includeImages;
+                return true;
+            }
+            item.ontoggle = async function (event) {
+                var version = detailVersion(q.dbId);
+                if (!item.open || loading || (loaded === version && !event)) return;
+                loading = true; body.textContent = '正在加载详情…';
+                try { if (await load(imagesLoaded, version)) loaded = version; }
+                catch (error) { body.textContent = error.message + '；收起后展开可重试'; }
+                finally { loading = false; if (item.open && version !== detailVersion(q.dbId)) item.ontoggle(); }
+            };
+        }
+        async function search(index) {
+            await operation(async function () {
+                var filters = index == null ? { query: field('bankQuery').value.trim(), bank: field('bankFilter').value, type: field('bankType').value, tag: field('bankTag').value } : searchFilters;
+                if (!filters) return;
+                var target = index == null ? 0 : index, before = index == null ? 0 : cursors[target];
+                message('正在查询…');
+                var result = await request('search', Object.assign({}, filters, { before: before, pageSize: 20 }));
+                searchFilters = filters; if (index == null) cursors = [0]; pageIndex = target; cursor = result.nextCursor; more = result.more;
+                cursors[pageIndex + 1] = cursor; field('bankResults').textContent = '';
+                result.questions.forEach(function (q) { questionCard(field('bankResults'), q); });
+                field('bankPage').textContent = '第 ' + (pageIndex + 1) + ' 页'; message('本页 ' + result.questions.length + ' 道题' + (more ? '，可继续下一页' : '，已到末页'));
             });
         }
+        function renderPreview(result) {
+            var root = field('bankPreview'); root.textContent = '';
+            node(root, 'p', pendingImport && pendingImport.payload && pendingImport.payload.name || '文件检查', 'bank-summary');
+            if (result) {
+                node(root, 'p', '共 ' + result.total + ' 题 · 新增 ' + result.inserted + ' · 重复 ' + result.duplicates + ' · 冲突 ' + result.importConflicts + ' · 图片 ' + result.images + ' 张', 'note');
+                node(root, 'p', Object.keys(result.types || {}).map(function (type) { return (typeNames[type] || type) + ' ' + result.types[type]; }).join(' / '), 'note');
+            }
+            if (importIssues.length) {
+                node(root, 'p', '发现 ' + (result ? Math.max(result.errorCount, importIssues.length) : importIssues.length) + ' 个问题，修正后重新选取文件。以下最多列出 1000 项。', 'bank-issue');
+                var list = node(root, 'ol'); importIssues.forEach(function (issue) { node(list, 'li', issue.location + '：' + issue.error, 'bank-issue'); });
+            }
+            importWarnings.forEach(function (warning) { node(root, 'p', warning, 'note'); });
+            if (result && result.samples.length) {
+                var samples = node(root, 'details'); node(samples, 'summary', '题目预览（前 ' + result.samples.length + ' 道有效题，图片在导入后按需读取）');
+                result.samples.forEach(function (q) { var item = node(samples, 'details'); node(item, 'summary', '第 ' + q.index + ' 题 · ' + q.stem); showQuestion(item, q); });
+            }
+        }
+        function location(index) { var source = locations[index - 1]; return source ? 'Word 第 ' + source.number + ' 题（段落 ' + source.paragraph + '）' : '第 ' + index + ' 题（questions[' + (index - 1) + ']）'; }
+        async function checkImportImages(payload) {
+            if (!payload || !Array.isArray(payload.questions)) return;
+            var checked = new Map(), rejected = new Set(importIssues.map(function (issue) { return issue.index; }));
+            for (var i = 0; i < payload.questions.length; i++) {
+                var q = payload.questions[i];
+                if (!q || !Array.isArray(q.images) || rejected.has(i + 1)) continue;
+                for (var image of q.images) {
+                    var url = image && image.dataUrl;
+                    if (typeof url !== 'string' || !/^data:image\/(?:png|jpeg|gif|webp);base64,/.test(url)) continue;
+                    if (!checked.has(url)) {
+                        try { await loadBankImage(url); checked.set(url, true); }
+                        catch (_) { checked.set(url, false); }
+                    }
+                    if (!checked.get(url)) {
+                        importIssues.push({ index: i + 1, location: location(i + 1), error: '图片无法解码：[图片:' + image.id + ']' });
+                        break;
+                    }
+                }
+            }
+        }
+        function wordImportPayload(payload) {
+            var sharedImages = Object.create(null);
+            var questions = payload.questions.map(function (question) {
+                if (!question.images) return question;
+                return Object.assign({}, question, { images: question.images.map(function (image) {
+                    sharedImages[image.id] = image.dataUrl;
+                    return { id: image.id };
+                }) });
+            });
+            return Object.assign({}, payload, { questions: questions, sharedImages: sharedImages });
+        }
+        field('bankImportFormat').onchange = function () { field('bankImport').textContent = field('bankImportFormat').value === 'docx' ? '导入 Word 题库' : '导入 JSON 题库'; };
+        field('bankImport').onclick = function () { field('bankFile').accept = field('bankImportFormat').value === 'docx' ? '.docx' : '.json'; field('bankFile').value = ''; field('bankFile').click(); };
+        field('bankFile').onchange = function () {
+            var file = field('bankFile').files[0]; field('bankFile').value = ''; if (!file) return;
+            operation(async function () {
+                pendingImport = null; previewState = null; importWarnings = []; importIssues = []; locations = []; field('bankPreview').textContent = ''; message('正在读取并检查文件…');
+                try {
+                    if (file.size > 8 * 1024 * 1024) throw new Error('文件不能超过 8 MiB');
+                    var isWord = /\.docx$/i.test(file.name);
+                    if (!isWord && !/\.json$/i.test(file.name)) throw new Error('请选择 .docx 或 .json 文件');
+                    var content = await new Promise(function (resolve, reject) { var reader = new FileReader(); reader.onload = function () { resolve(reader.result); }; reader.onerror = function () { reject(new Error('文件读取失败')); }; if (isWord) reader.readAsArrayBuffer(file); else reader.readAsText(file, 'utf-8'); });
+                    var payload;
+                    if (isWord) {
+                        if (!w.__cefParseBankDocx) throw new Error('Word 模块未就绪，请更新 DLL');
+                        var parsed = w.__cefParseBankDocx(new Uint8Array(content), file.name, { preview: true }); payload = parsed.payload; importWarnings = parsed.warnings; locations = parsed.locations || [];
+                        importIssues = (parsed.errors || []).map(function (issue) { return { index: issue.index, location: location(issue.index), error: issue.error }; });
+                    } else {
+                        try { payload = JSON.parse(String(content).replace(/^\uFEFF/, '')); }
+                        catch (error) {
+                            var at = /position (\d+)/.exec(error.message), position = at ? Number(at[1]) : null;
+                            var prefix = position == null ? 'JSON 语法错误' : 'JSON 第 ' + String(content).slice(0, position).split('\n').length + ' 行';
+                            throw new Error(prefix + '：' + error.message);
+                        }
+                    }
+                    var transport = isWord ? wordImportPayload(payload) : payload;
+                    if (new Blob([JSON.stringify(transport)]).size > 9 * 1024 * 1024) throw new Error('解析后超过 9 MiB，请拆分文档或压缩图片');
+                    await checkImportImages(payload);
+                    pendingImport = { payload: transport, format: isWord ? 'docx' : 'json' };
+                    previewState = await request('preview', pendingImport);
+                    (previewState.errors || []).forEach(function (issue) { if (!importIssues.some(function (existing) { return existing.index === issue.index; })) importIssues.push({ index: issue.index, location: location(issue.index), error: issue.error }); });
+                    renderPreview(previewState); message(importIssues.length ? '预检发现问题，尚未写入题库' : '预检完成，确认导入后才会写入题库', importIssues.length > 0);
+                } catch (error) { importIssues.push({ location: file.name, error: error.message }); renderPreview(null); message('预检失败，尚未写入题库', true); }
+            });
+        };
+        field('bankConfirm').onclick = function () {
+            if (!pendingImport || !previewState || !previewState.valid || importIssues.length) return;
+            operation(async function () {
+                message('正在导入…');
+                var result = await request('import', Object.assign({ revision: previewState.revision }, pendingImport));
+                if (result.inserted || result.importConflicts) changed(result);
+                pendingImport = null; previewState = null; field('bankPreview').textContent = '';
+                message('导入完成：新增 ' + result.inserted + '，重复跳过 ' + result.duplicates + '，待处理冲突 ' + result.importConflicts);
+            });
+        };
+        field('bankCancelImport').onclick = function () { pendingImport = null; previewState = null; importIssues = []; importWarnings = []; field('bankPreview').textContent = ''; message('已取消预览，未写入题库'); controls(); };
+        field('bankErrorExport').onclick = function () {
+            var text = importIssues.map(function (issue) { return issue.location + '：' + issue.error; }).concat(importWarnings).join('\r\n');
+            var url = URL.createObjectURL(new Blob(['\uFEFF' + text], { type: 'text/plain;charset=utf-8' }));
+            var a = node(field('bankImportView'), 'a'); a.href = url; a.download = '题库导入问题.txt'; a.click(); a.remove(); setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
+        };
+        function ensureConflicts() {
+            if (busy) { conflictLoadPending = true; return; }
+            loadConflicts(false, true);
+        }
+        function rememberConflictDraft(item) {
+            var read = conflictDraftReaders.get(item);
+            if (!read) return;
+            var id = item.getAttribute('data-conflict-id'), draft = read();
+            if (Object.keys(draft).length) conflictDrafts.set(id, draft);
+            else conflictDrafts.delete(id);
+        }
+        async function loadConflicts(append, preserve) {
+            await operation(async function () {
+                var bank = field('bankConflictFilter').value, list = field('bankConflicts');
+                var result = await request('conflicts', append
+                    ? { bank: bank, after: conflictCursor, revision: conflictListRevision } : { bank: bank, after: 0 });
+                var restarted = append && result.revision !== conflictListRevision;
+                if (restarted) { append = false; update(result.status); }
+                if (preserve && bank === conflictListBank && result.revision === conflictListRevision) {
+                    message(list.children.length ? '展开冲突，对比两版内容后处理' : '当前范围没有待处理冲突');
+                    return;
+                }
+                var rows = doc.createDocumentFragment(), existing = new Map();
+                if (preserve) Array.prototype.forEach.call(list.children, function (item) { existing.set(item.getAttribute('data-conflict-id'), item); });
+                conflictCursor = result.nextCursor; conflictMore = result.more;
+                result.conflicts.forEach(function (entry) {
+                    var prior = existing.get(String(entry.id));
+                    if (prior) { rows.appendChild(prior); return; }
+                    var item = node(rows, 'details'), content = node(item, 'div'), loading = false, loaded = -1;
+                    item.setAttribute('data-conflict-id', entry.id); item.setAttribute('data-bank-question', entry.dbId);
+                    var title = doc.createElement('summary'); title.textContent = entry.bank + ' · ' + entry.stem; item.insertBefore(title, content);
+                    item.ontoggle = async function () {
+                        var version = detailVersion(entry.dbId);
+                        if (!item.open || loaded === version || loading) return;
+                        rememberConflictDraft(item); conflictDraftReaders.delete(item);
+                        loading = true; content.textContent = '正在加载对比…';
+                        try {
+                            var result = await request('conflictDetail', { id: entry.id });
+                            if (version !== detailVersion(entry.dbId)) return;
+                            content.textContent = '';
+                            title.textContent = result.bank + ' · ' + result.current.stem;
+                            ['current', 'incoming'].forEach(function (key) { var group = node(content, 'details'); group.open = true; node(group, 'summary', key === 'current' ? '原题' : '新题'); showQuestion(group, result[key]); });
+                            var difference = Object.keys(result.current).concat(Object.keys(result.incoming)).filter(function (key, i, all) { return all.indexOf(key) === i && JSON.stringify(result.current[key]) !== JSON.stringify(result.incoming[key]); });
+                            node(content, 'p', '差异字段：' + (difference.map(function (key) { return ({ id: '题目编号', type: '题型', stem: '题干', options: '选项', answer: '答案', explanation: '解析', tags: '标签', source: '来源' })[key] || key; }).join('、') || '文字相同，请核对图片'), 'note');
+                            var images = button(content, '查看两版图片', async function () {
+                                images.disabled = true;
+                                try { var full = await request('conflictDetail', { id: entry.id, images: true }); if (full.revision !== result.revision) throw new Error('题库已变化，请刷新冲突'); node(content, 'p', '原题图片', 'note'); showImages(content, full.current.images); node(content, 'p', '新题图片', 'note'); showImages(content, full.incoming.images); images.remove(); }
+                                catch (error) { message(error.message, true); images.disabled = false; }
+                            });
+                            var editorGroup = node(content, 'details'); node(editorGroup, 'summary', '手动修正（保留原题图片）');
+                            function edit(label, value, parent) {
+                                var group = node(parent || editorGroup, 'label', label, 'field'), input = node(group, 'textarea');
+                                input.defaultValue = value; input.setAttribute('aria-label', label); input.style.minHeight = '64px'; return input;
+                            }
+                            var stemEditor = edit('题干', result.current.stem);
+                            var optionEditors = (result.current.options || []).map(function (option) { return edit('选项 ' + option.id, option.text); });
+                            var type = result.current.type, originalAnswer = result.current.answer;
+                            var answerEditor, blankFields, addBlank, choiceAnswers;
+                            if (type === 'blank') {
+                                blankFields = node(editorGroup, 'div');
+                                function numberBlanks() {
+                                    Array.prototype.forEach.call(blankFields.children, function (group, i) { group.firstChild.textContent = '第 ' + (i + 1) + ' 空'; });
+                                }
+                                addBlank = function (variants) {
+                                    var group = node(blankFields, 'fieldset'); node(group, 'legend');
+                                    var fields = node(group, 'div');
+                                    function addVariant(value) {
+                                        var row = node(fields, 'div');
+                                        edit('可接受答案', value, row);
+                                        button(row, '移除此答案', function () { row.remove(); });
+                                    }
+                                    variants.forEach(addVariant);
+                                    var tools = node(group, 'div', null, 'bank-nav');
+                                    button(tools, '添加可接受答案', function () { addVariant(''); });
+                                    button(tools, '移除此空', function () { group.remove(); numberBlanks(); });
+                                    numberBlanks();
+                                };
+                                originalAnswer.forEach(addBlank);
+                                button(editorGroup, '添加空位', function () { addBlank(['']); });
+                            } else if (type === 'single' || type === 'multiple') {
+                                var choices = node(editorGroup, 'fieldset'); node(choices, 'legend', '答案');
+                                choiceAnswers = result.current.options.map(function (option) {
+                                    var label = node(choices, 'label', null, 'field'), input = node(label, 'input');
+                                    input.type = type === 'single' ? 'radio' : 'checkbox'; input.name = 'bank-answer-' + entry.id;
+                                    input.value = option.id; input.checked = originalAnswer.indexOf(option.id) >= 0;
+                                    label.appendChild(doc.createTextNode(' ' + option.id + '. ' + option.text));
+                                    return input;
+                                });
+                            } else {
+                                var answerLabel = type === 'boolean' ? '答案（正确或错误）' : '答案';
+                                var editableAnswer = type === 'boolean' ? (originalAnswer ? '正确' : '错误') : originalAnswer;
+                                answerEditor = edit(answerLabel, editableAnswer);
+                            }
+                            var explanationEditor = edit('解析', result.current.explanation || '');
+                            function editedText(input) {
+                                return input.value === input.defaultValue.replace(/\r\n?/g, '\n') ? input.defaultValue : input.value;
+                            }
+                            function editedAnswer() {
+                                if (blankFields) return Array.from(blankFields.children, function (group) { return Array.from(group.querySelectorAll('textarea'), editedText); });
+                                if (choiceAnswers) return choiceAnswers.filter(function (input) { return input.checked; }).map(function (input) { return input.value; }).sort();
+                                return editedText(answerEditor);
+                            }
+                            var unavailableOptions = [], unavailableAnswer = null;
+                            conflictDraftReaders.set(item, function () {
+                                var draft = {}, stem = editedText(stemEditor), explanation = editedText(explanationEditor);
+                                if (stem !== stemEditor.defaultValue) draft.stem = stem;
+                                if (explanation !== explanationEditor.defaultValue) draft.explanation = explanation;
+                                var options = result.current.options.map(function (option, i) {
+                                    return { id: option.id, text: editedText(optionEditors[i]) };
+                                }).filter(function (option, i) { return option.text !== result.current.options[i].text; });
+                                if (options.length || unavailableOptions.length) draft.options = options.concat(unavailableOptions);
+                                var answer = editedAnswer();
+                                if (JSON.stringify(answer) !== JSON.stringify(answerEditor ? answerEditor.defaultValue : originalAnswer)) {
+                                    draft.type = type; draft.answer = answer;
+                                } else if (unavailableAnswer) { draft.type = unavailableAnswer.type; draft.answer = unavailableAnswer.answer; }
+                                return draft;
+                            });
+                            var draft = conflictDrafts.get(String(entry.id));
+                            if (draft) {
+                                node(editorGroup, 'p', '已恢复未保存的草稿，请对照原题后再保存。', 'note');
+                                if (draft.stem !== undefined) stemEditor.value = draft.stem;
+                                if (draft.explanation !== undefined) explanationEditor.value = draft.explanation;
+                                (draft.options || []).forEach(function (option) {
+                                    var index = result.current.options.findIndex(function (current) { return current.id === option.id; });
+                                    if (index >= 0) optionEditors[index].value = option.text;
+                                    else {
+                                        unavailableOptions.push(option);
+                                        node(editorGroup, 'div', '草稿中已不存在的选项 ' + option.id + '：' + option.text, 'bank-answer');
+                                    }
+                                });
+                                if (draft.answer !== undefined) {
+                                    if (draft.type !== type || choiceAnswers && draft.answer.some(function (id) { return !choiceAnswers.some(function (input) { return input.value === id; }); })) {
+                                        unavailableAnswer = { type: draft.type, answer: draft.answer };
+                                        node(editorGroup, 'div', '草稿答案与当前题型或选项不同，请重新核对：' + JSON.stringify(draft.answer), 'bank-answer');
+                                    } else if (blankFields) {
+                                        blankFields.textContent = ''; draft.answer.forEach(addBlank);
+                                    } else if (choiceAnswers) {
+                                        choiceAnswers.forEach(function (input) { input.checked = draft.answer.indexOf(input.value) >= 0; });
+                                    } else answerEditor.value = draft.answer;
+                                }
+                            }
+                            var actions = node(content, 'div', null, 'bank-nav');
+                            ['keep', 'incoming', 'manual'].forEach(function (decision, i) {
+                                button(actions, ['保留原题', '采用新题', '保存修正'][i], function () {
+                                    operation(async function () {
+                                        var values = { id: entry.id, revision: result.revision, decision: decision };
+                                        if (decision === 'manual') {
+                                            var q = JSON.parse(JSON.stringify(result.current));
+                                            q.stem = editedText(stemEditor); q.explanation = editedText(explanationEditor);
+                                            q.options.forEach(function (option, index) { option.text = editedText(optionEditors[index]); });
+                                            if (blankFields || choiceAnswers) q.answer = editedAnswer();
+                                            else if (editedText(answerEditor) !== answerEditor.defaultValue) {
+                                                var answer = answerEditor.value.trim();
+                                                if (type === 'boolean') {
+                                                    if (!/^(正确|错误|对|错|true|false)$/i.test(answer)) throw new Error('判断题答案请填写“正确”或“错误”');
+                                                    q.answer = /^(正确|对|true)$/i.test(answer);
+                                                } else q.answer = answerEditor.value;
+                                            }
+                                            values.question = q;
+                                        }
+                                        var state;
+                                        try { state = await request('resolve', values); }
+                                        catch (error) {
+                                            if (error.code === 'BANK_REVISION') invalidateQuestionDetails(entry.dbId);
+                                            throw error;
+                                        }
+                                        conflictDrafts.delete(String(entry.id)); changed(state); item.remove();
+                                        if (state.questionChanged) invalidateQuestionDetails(entry.dbId);
+                                        message('冲突已处理，处理历史已保存。' + (state.questionChanged ? '同题其他冲突请重新展开核对。' : ''));
+                                    });
+                                });
+                            });
+                            loaded = version;
+                        } catch (error) { content.textContent = error.message + '；收起后展开可重试'; }
+                        finally { loading = false; if (item.open && version !== detailVersion(entry.dbId)) item.ontoggle(); }
+                    };
+                });
+                if (!append) {
+                    Array.prototype.forEach.call(list.children, rememberConflictDraft);
+                    list.textContent = ''; conflictListBank = bank; conflictListRevision = result.revision;
+                }
+                list.appendChild(rows);
+                message(restarted ? '题库已变化，已从第一页更新冲突' :
+                    result.conflicts.length ? '展开冲突，对比两版内容后处理' : '当前范围没有待处理冲突');
+            });
+        }
+        function renderReviews() {
+            var root = field('bankReviews'), filter = field('bankReviewFilter').value, next = root.firstChild;
+            var entries = bankReviews.filter(function (entry) { return !filter || filter === 'attention' && entry.reason !== 'matched' || entry.reason === filter; });
+            entries.forEach(function (entry) {
+                var item = reviewRows.get(entry);
+                if (!item) {
+                    item = doc.createElement('details'); node(item, 'summary', (reasons[entry.reason] || entry.reason) + ' · ' + (entry.question || '图片题'));
+                    node(item, 'p', new Date(entry.at).toLocaleTimeString() + (entry.bank ? ' · ' + entry.bank : '') + (entry.detail ? '\n' + entry.detail : ''), 'note');
+                    node(item, 'div', '页面题干：' + entry.question, 'bank-answer');
+                    entry.options.forEach(function (text) { node(item, 'div', text, 'bank-answer'); });
+                    node(item, 'p', '页面图片 ' + entry.imageCount + ' 张' + (entry.blanks != null ? ' · 可填写空数 ' + entry.blanks : ''), 'note');
+                    if (entry.answer) node(item, 'div', '匹配结果：' + JSON.stringify(entry.answer.choices || entry.answer.answers || []), 'bank-answer');
+                    if (entry.candidates.length) { node(item, 'p', '候选题对比（最多 8 条）', 'note'); entry.candidates.forEach(function (q) { questionCard(item, q, entry); }); }
+                    else node(item, 'p', '没有可展示的候选题，可在浏览页搜索关键词。', 'note');
+                    reviewRows.set(entry, item);
+                }
+                if (item !== next) root.insertBefore(item, next);
+                next = item.nextSibling;
+            });
+            while (next) { var old = next; next = old.nextSibling; root.removeChild(old); }
+            if (!entries.length) node(root, 'p', '暂无符合条件的匹配记录。开启题库答题后会自动记录。', 'note');
+            root.querySelectorAll('.bank-result[open]').forEach(function (item) { item.ontoggle(); });
+        }
+        refreshBankReviews = function () { if (currentView === 'review') renderReviews(); };
+        function view(name) {
+            currentView = name;
+            ['Browse', 'Import', 'Conflict', 'Review'].forEach(function (key) { field('bank' + key + 'View').hidden = key.toLowerCase() !== name; field('bank' + key + 'Tab').setAttribute('data-active', String(key.toLowerCase() === name)); });
+            if (name === 'conflict') ensureConflicts();
+            if (name === 'review') renderReviews();
+        }
+        ['Browse', 'Import', 'Conflict', 'Review'].forEach(function (key) { field('bank' + key + 'Tab').onclick = function () { view(key.toLowerCase()); }; });
+        field('bankSearch').onclick = function () { search(); };
+        field('bankPrev').onclick = function () { search(pageIndex - 1); }; field('bankNext').onclick = function () { search(pageIndex + 1); };
+        ['bankFilter', 'bankType'].forEach(function (id) { field(id).onchange = function () { search(); }; });
+        ['bankQuery', 'bankTag'].forEach(function (id) { field(id).onkeydown = function (event) { if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); search(); } }; });
+        field('bankConflictRefresh').onclick = field('bankConflictFilter').onchange = function () { loadConflicts(false); };
+        field('bankConflictMore').onclick = function () { loadConflicts(true); };
+        field('bankReviewFilter').onchange = renderReviews; field('bankReviewClear').onclick = function () { bankReviews = []; renderReviews(); };
         field('bankAnswerMode').value = cfg.bankAnswerMode;
-        field('bankAnswerMode').onchange = function () {
-            var mode = field('bankAnswerMode').value;
-            configure(Object.assign({}, cfg, { bankAnswerMode: mode }));
-            rememberPreference('bankAnswerMode', mode, true);
-            message(mode === 'off' ? '本地题库答题已关闭' : mode === 'only' ? '仅本地题库答题已开启，不调用 AI；未命中会跳过' : '题库优先已开启；仅在 DeepSeek 开启且配置 Key 时回退到 AI');
-        };
+        ['bankAnswerMode', 'bankScope'].forEach(function (id) { field(id).onchange = function () {
+            var value = field(id).value, next = {}; next[id] = value; configure(Object.assign({}, cfg, next)); rememberPreference(id, value, true); message('匹配设置已更新');
+        }; });
         field('bankStart').onclick = function () {
-            if (!w.__cxUpstreamAI || !w.__cxUpstreamAI.start) { message('当前页面不支持自动填写，请进入超星答题页面后操作', true); return; }
+            if (!w.__cxUpstreamAI || !w.__cxUpstreamAI.start) { message('请进入支持的答题页面后操作', true); return; }
             if (cfg.bankAnswerMode === 'off') { field('bankAnswerMode').value = 'only'; field('bankAnswerMode').onchange(); }
-            w.__cxUpstreamAI.setPaused(false); w.__cxUpstreamAI.start();
-            field('tabAnswer').click();
+            w.__cxUpstreamAI.setPaused(false); w.__cxUpstreamAI.start(); field('tabAnswer').click();
         };
-        field('bankSearch').onclick = function () { run('search', { query: field('bankQuery').value.trim() }); };
-        field('bankQuery').onkeydown = function (event) { if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); field('bankSearch').click(); } };
-        field('bankImportFormat').onchange = function () {
-            field('bankImport').textContent = field('bankImportFormat').value === 'docx' ? '导入 Word 题库' : '导入 JSON 题库';
-        };
-        field('bankImport').onclick = function () {
-            var format = field('bankImportFormat').value;
-            field('bankFile').accept = format === 'docx' ? '.docx' : '.json';
-            field('bankFile').value = ''; field('bankFile').click();
-        };
-        field('bankFile').onchange = async function () {
-            var file = field('bankFile').files[0]; field('bankFile').value = '';
-            if (!file || busy) return;
-            busy = true; controls(); message('正在读取导入文件…');
-            try {
-                if (file.size > 8 * 1024 * 1024) throw new Error('每次导入的文件不能超过 8 MiB');
-                var isWord = /\.docx$/i.test(file.name); importWarnings = [];
-                if (!isWord && !/\.json$/i.test(file.name)) throw new Error('请选择 .docx 或 .json 文件；旧版 .doc 请先另存为 .docx');
-                var content = await new Promise(function (resolve, reject) { var reader = new FileReader(); reader.onload = function () { resolve(reader.result); }; reader.onerror = function () { reject(new Error('无法读取所选文件')); }; if (isWord) reader.readAsArrayBuffer(file); else reader.readAsText(file, 'utf-8'); });
-                var payload;
-                if (isWord) {
-                    if (!w.__cefParseBankDocx) throw new Error('Word 导入模块未就绪，请更新 DLL 并重启');
-                    message('正在解析 Word 题目和图片…');
-                    var parsed = w.__cefParseBankDocx(new Uint8Array(content), file.name); payload = parsed.payload; importWarnings = parsed.warnings;
-                } else payload = JSON.parse(String(content).replace(/^\uFEFF/, ''));
-                if (new Blob([JSON.stringify(payload)]).size > 9 * 1024 * 1024) throw new Error('解析后的题库超过 9 MiB，请拆分文档或压缩图片后导入');
-                busy = false; await run('import', { payload: payload });
-            } catch (error) { message('导入失败：' + error.message, true); }
-            finally { busy = false; controls(); }
-        };
-        controls();
-        return function () { run('status'); };
+        view('browse'); controls();
+        return function () { operation(async function () { update(await request('status')); }); };
     }
+
     function openSettings() {
         if (!doc || !doc.body) return;
         if (panelVisible()) return;
@@ -1602,14 +2413,8 @@
         if (dialog) {
             dialog.host.style.display = 'block';
             dialog.panel.getElementById('enabled').checked = cfg.enabled;
-            dialog.panel.getElementById('base').value = cfg.baseUrl;
-            dialog.panel.getElementById('model').value = cfg.model;
-            dialog.panel.getElementById('mode').value = cfg.mode;
-            dialog.panel.getElementById('answerDelay').value = String(cfg.answerDelayMs / 1000);
-            dialog.panel.getElementById('overwritePolicy').value = cfg.overwritePolicy;
-            updatePauseControl(answeringPaused());
             var old = dialog.host.getBoundingClientRect(); movePanel(old.left, old.top);
-            loadHotkeyFields(); renderHotkeyHints(); dialog.panel.getElementById('dismiss').focus({ preventScroll: true }); return;
+            syncPanelFields(); renderHotkeyHints(); dialog.panel.getElementById('dismiss').focus({ preventScroll: true }); return;
         }
         var host = doc.createElement('div'); host.id = 'cef-deepseek-settings';
         host.style.cssText = 'position:fixed;left:0;top:300px;width:340px;max-width:100vw;height:500px;max-height:100vh;z-index:2147483647;display:block;isolation:isolate';
@@ -1624,7 +2429,7 @@
             '.tabs{display:flex;flex-shrink:0;gap:6px;margin:0 16px 12px;padding:3px;background:#f3f6fa;border-radius:9px}.tabs button{flex:1;border:0;padding:6px;background:transparent}.tabs button[data-active=true]{background:#fff;color:#334155;box-shadow:0 1px 4px #0f172a12}.pane[hidden]{display:none!important}.chat-log{height:265px;overflow:auto;padding:4px 0 8px}.chat-message{max-width:88%;margin:7px 0;padding:8px 10px;border-radius:10px;white-space:pre-wrap;word-break:break-word;background:#f1f5f9;color:#334155}.chat-message.user{margin-left:auto;background:#eef2f6}.chat-message.assistant{margin-right:auto}.chat-images{display:flex;gap:5px;flex-wrap:wrap;margin:4px 0 7px}.chat-images span{font-size:11px;padding:3px 6px;border-radius:12px;background:#eef2f7;color:#64748b}.chat-images button{border:0;background:transparent;padding:0;color:#94a3b8}.chat-compose textarea:focus{outline:none;border-color:#cbd5e1;box-shadow:none}.chat-compose textarea{width:100%;height:64px;resize:none;border:1px solid #e2e8f0;border-radius:8px;padding:8px;color:#334155}.chat-actions{display:flex;justify-content:space-between;margin-top:7px}.chat-actions #chatSend{background:#f8fafc;border-color:#e2e8f0;color:#475569}.chat-actions #chatSend:hover{background:#f1f5f9}.paste-hint{font-size:11px;color:#94a3b8;margin-top:5px}' +
             '.chat-rich{line-height:1.65;min-width:0;max-width:100%}.chat-message.assistant{max-width:100%}.chat-rich ul,.chat-rich ol{margin:6px 0;padding-left:24px;white-space:normal}.chat-rich h1,.chat-rich h2,.chat-rich h3{font-size:1.1em;margin:8px 0}.chat-rich code{font-family:Consolas,monospace;background:#e2e8f0;border-radius:3px;padding:1px 3px}.chat-code{min-width:0;max-width:100%;margin:8px 0;border:1px solid #dbe3ee;border-radius:6px;overflow:hidden;white-space:normal}.chat-code-toolbar{display:flex;flex-wrap:wrap;gap:6px;justify-content:space-between;align-items:center;padding:4px 8px;background:#e2e8f0;font-size:11px}.chat-code-actions{display:flex;flex-wrap:wrap;gap:5px;margin-left:auto}.chat-code-toolbar button{font-size:11px;padding:2px 6px}.chat-code pre{margin:0;padding:10px;max-width:100%;overflow:auto;white-space:pre;overflow-wrap:normal;word-break:normal;tab-size:4;background:#f8fafc}.chat-code[data-wrap=true] pre{white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word}.chat-code pre code{display:block;padding:0;background:none;white-space:inherit;overflow-wrap:inherit;word-break:inherit}.chat-rich .katex-display{overflow-x:auto;overflow-y:hidden;padding:4px 0}.chat-log{overflow-anchor:none}#chatLatest{display:block;margin:4px auto;font-size:11px;color:#334155}#chatLatest[hidden]{display:none}' +
             'footer{padding:10px 16px 10px;border-top:1px solid #f1f5f9;flex-shrink:0;color:#94a3b8;font-size:11px}footer .row{margin-bottom:5px}#opacity{appearance:none;-webkit-appearance:none;display:block;width:100%;height:4px;padding:0;margin:6px 0;border:0;border-radius:10px;background:#e7ebf0;cursor:pointer}#opacity::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:11px;height:11px;border:0;border-radius:50%;background:#94a3b8}#files{display:none}.answer-value{max-height:none;white-space:pre-wrap;font-size:14px;line-height:1.65}.progress table,.progress thead,.progress tbody{display:block;width:100%}.progress tr{display:grid;grid-template-columns:28px minmax(0,1fr) 94px;width:100%}.progress th,.progress td{display:block;min-width:0}.progress tr.long-answer-row td:nth-child(2){grid-column:2 / -1}.progress tr.long-answer-row td:last-child{grid-column:2 / -1;width:auto;padding:10px 8px 12px;background:#f8fafc;border-radius:6px;margin-bottom:8px;word-break:normal}.long-answer-row .answer-value{font-family:Consolas,"Microsoft YaHei",monospace;overflow-wrap:anywhere;word-break:normal}.answer-label{font-size:11px;font-family:"Segoe UI","Microsoft YaHei",sans-serif;color:#64748b;margin-bottom:6px}.progress-images{margin-top:6px}.progress-image-state{display:block;font-size:10px;color:#94a3b8;margin:3px 0}.progress-image{display:block;width:100%;max-width:100%;height:auto;max-height:none;margin:4px 0 8px;border:1px solid #e2e8f0;border-radius:5px}.balance-row{display:flex;align-items:center;gap:8px;margin:0 0 8px}.balance-row #balanceStatus{flex:1;font-size:11px;color:#64748b;overflow-wrap:anywhere}.balance-row #balanceStatus[data-state=error]{color:#c05050}.balance-row #balanceStatus[data-state=success]{color:#23866a}#balanceRefresh{font-size:11px;padding:4px 7px;white-space:nowrap}.chat-log{height:clamp(90px,28vh,265px)}.chat-images img{width:48px;height:36px;object-fit:contain}.chat-toolbar{display:flex;gap:5px;flex-wrap:wrap;margin:5px 0}.chat-toolbar button{font-size:11px;padding:4px 6px}#requestStats{font-size:10px;color:#64748b;overflow-wrap:anywhere;margin:5px 0}#panelResize{position:absolute;bottom:0;right:0;width:16px;height:16px;cursor:nwse-resize;touch-action:none;background:linear-gradient(135deg,transparent 45%,#94a3b8 46%,#94a3b8 55%,transparent 56%);border:0;padding:0}#chatStop{color:#b55b60}.hotkey-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}.hotkey-grid input{cursor:pointer;font-size:11px}#settingsPane .enable-row{min-height:24px;margin:0 0 6px;color:#334155;font-weight:500}#settingsPane .note{color:#84909f;margin:0 0 12px;line-height:1.7}#settingsPane .note+.enable-row{border-top:1px solid #f1f5f9;padding-top:14px;margin-top:14px}#settingsPane #universalStatus{color:#64748b}.bank-summary{margin:0 0 6px;color:#475569}.bank-actions{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.bank-actions button{font-size:12px;padding:6px 8px}#bankPath,#bankStatus{overflow-wrap:break-word}#bankStatus[data-state=error]{color:#b55b60}.bank-format{margin-top:12px}.bank-format pre{white-space:pre-wrap;word-break:break-word;padding:8px;background:#f8fafc;font:11px/1.6 Consolas,monospace}.bank-result{padding:10px 0;border-top:1px solid #e2e8f0;white-space:pre-wrap;overflow-wrap:break-word}.bank-result summary{cursor:pointer;color:#334155}.bank-answer{margin-top:8px;padding:8px;background:#f8fafc;border-radius:6px}.bank-result .note{margin:5px 0}</style>' +
-            '<section role="dialog" aria-label="设置面板" aria-modal="false"><header id="titlebar"><span aria-hidden="true"></span><button id="dismiss" aria-label="关闭面板" title="关闭 (Ctrl+G)">×</button></header><nav class="tabs"><button id="tabAnswer" data-active="true">答题</button><button id="tabChat">对话</button><button id="tabBank">题库</button><button id="tabSettings">设置</button></nav><div class="content"><div id="bankPane" class="pane" hidden><p id="bankSummary" class="bank-summary">正在读取默认题库…</p><p id="bankPath" class="note"></p><label class="field">导入格式<select id="bankImportFormat" class="control"><option value="docx" selected>Word 文档（.docx）</option><option value="json">JSON 文件（.json）</option></select></label><div class="bank-actions"><button id="bankImport" disabled>导入 Word 题库</button></div><input id="bankFile" type="file" accept=".docx" hidden><p class="note">题库固定使用 DLL 同目录的 question-bank.db，启动时自动创建和打开。导入支持 Word（.docx）和 JSON，每次最多 8 MiB、10000 道题。重复跳过，冲突保留原题。</p><label class="field">题库答题<select id="bankAnswerMode" class="control"><option value="off">关闭题库答题</option><option value="only">仅本地题库</option><option value="first">题库优先，未命中再用 DeepSeek</option></select></label><button id="bankStart" disabled>开始题库答题</button><p class="note">按题干和选项内容匹配，冲突与不明确的结果跳过。沿用答题页的暂停、间隔与覆盖设置。</p><label class="field">搜索题干<input id="bankQuery" class="control" maxlength="512" placeholder="输入关键词，留空查看最近导入的题目" disabled></label><button id="bankSearch" disabled>查询题库</button><p id="bankStatus" class="note" role="status"></p><details class="bank-format"><summary>导入格式</summary><pre>{"schemaVersion":1,"name":"示例题库","questions":[{"id":"q1","type":"boolean","stem":"Python 的列表可修改。","answer":true,"explanation":"列表是可变类型。"}]}</pre><p class="note">题型：single 单选、multiple 多选、boolean 判断、blank 填空、text 简答。选择题答案填选项 ID 数组；填空题每个空使用可接受答案数组；简答题答案为文字。Word 使用“1.【单选题】题干、A.选项、答案：B、答案解析：…”格式；支持嵌入题图，图片题按题干、选项与图片共同匹配。</p></details><div id="bankResults"></div></div><div id="settingsPane" class="pane" hidden><label class="row enable-row"><span>DeepSeek</span><input id="enabled" class="feature-toggle" type="checkbox" aria-label="启用 DeepSeek"></label><p class="note">自动保存，立即生效。关闭后停止当前 AI 请求，保留 Key 和对话。</p><label class="row enable-row"><span>万能脚本</span><input id="universalEnabled" class="feature-toggle" type="checkbox" aria-label="启用万能脚本"></label><p class="note">自动保存，重启客户端后生效。关闭后不加载万能脚本的面板、题库和页面功能。</p><p id="universalStatus" class="note" role="status"></p><p id="universalVersion" class="note"></p><p class="note">来源：scriptcat.org · 脚本 616</p><p class="note">两个开关关闭后，仍可用 Ctrl+G 打开设置。复制粘贴增强继续可用。</p></div><div id="answerPane" class="pane">' +
+            '<section role="dialog" aria-label="设置面板" aria-modal="false"><header id="titlebar"><span aria-hidden="true"></span><button id="dismiss" aria-label="关闭面板" title="关闭 (Ctrl+G)">×</button></header><nav class="tabs"><button id="tabAnswer" data-active="true">答题</button><button id="tabChat">对话</button><button id="tabBank">题库</button><button id="tabSettings">设置</button></nav><div class="content"><div id="bankPane" class="pane" hidden></div><div id="settingsPane" class="pane" hidden><label class="row enable-row"><span>DeepSeek</span><input id="enabled" class="feature-toggle" type="checkbox" aria-label="启用 DeepSeek"></label><p class="note">自动保存，立即生效。关闭后停止当前 AI 请求，保留 Key 和对话。</p><label class="row enable-row"><span>万能脚本</span><input id="universalEnabled" class="feature-toggle" type="checkbox" aria-label="启用万能脚本"></label><p class="note">自动保存，重启客户端后生效。关闭后不加载万能脚本的面板、题库和页面功能。</p><p id="universalStatus" class="note" role="status"></p><p id="universalVersion" class="note"></p><p class="note">来源：scriptcat.org · 脚本 616</p><p class="note">两个开关关闭后，仍可用 Ctrl+G 打开设置。复制粘贴增强继续可用。</p></div><div id="answerPane" class="pane">' +
             '<label class="field">API Key<input class="control" id="key" type="password" autocomplete="off" placeholder="输入 Key，留空保留已配置值"></label><p class="note" style="margin:-6px 0 6px">保存在 DLL 同目录 config.json · API 调用可能收费</p>' +
             '<div class="balance-row"><span id="balanceStatus" role="status">API 余额 · 点击刷新查询</span><button id="balanceRefresh" title="只读查询，不生成答案；使用已保存的官方 Key">刷新余额</button></div><div class="actions"><button id="save">保存</button><button id="test" title="独立测试连接，可能产生少量 API 费用；不保存设置或获取题目">测试连接</button></div>' +
             '<div class="answer-controls"><label class="answer-setting"><span>逐题间隔</span><span class="delay-control"><input id="answerDelay" type="number" min="0" max="10" step="0.1" inputmode="decimal" aria-label="逐题间隔秒数"><em>秒</em></span></label><label class="answer-setting"><span>答题控制</span><button id="pause" type="button">暂停 · Ctrl+R</button></label></div>' +
@@ -1640,11 +2445,9 @@
         function updateUniversalStatus() {
             field('universalStatus').textContent = cfg.universalScriptEnabled !== universalScriptAtStartup ? '开关已更改，重启客户端后生效；请确认底部显示已保存。' : '本次启动：' + (universalScriptAtStartup ? '允许加载万能脚本' : '万能脚本已关闭');
         }
-        updateUniversalStatus(); field('base').value = cfg.baseUrl; field('model').value = cfg.model; field('mode').value = cfg.mode;
-        field('answerDelay').value = String(cfg.answerDelayMs / 1000);
-        field('overwritePolicy').value = cfg.overwritePolicy;
+        updateUniversalStatus();
         dialog = { host: host, panel: panel, status: field('status') };
-        loadHotkeyFields(); renderHotkeyHints();
+        syncPanelFields(); renderHotkeyHints();
         function switchPane(name) {
             var chatPane = name === 'chat';
             field('answerPane').hidden = name !== 'answer'; field('chatPane').hidden = !chatPane; field('settingsPane').hidden = name !== 'settings'; field('bankPane').hidden = name !== 'bank';
@@ -1677,10 +2480,11 @@
         field('enabled').onchange = function () {
             var value = field('enabled').checked;
             var nextMode = value && cfg.mode === 'legacy' ? 'ai-only' : cfg.mode;
+            var modeChanged = nextMode !== cfg.mode;
             configure(Object.assign({}, cfg, { enabled: value, mode: nextMode }));
-            field('mode').value = nextMode;
+            syncDraftField(field('mode'), nextMode);
             if (!value) { stopChat(); if (captureCancel) captureCancel(); }
-            rememberPreference('mode', nextMode, false);
+            if (modeChanged) rememberPreference('mode', nextMode, false);
             rememberPreference('enabled', value, true);
             showStatus(value ? 'DeepSeek 已开启' : 'DeepSeek 已关闭，当前 AI 请求已取消', 'success');
         };
@@ -1705,13 +2509,21 @@
         field('dismiss').onclick = hideSettings;
         function showStatus(message, state) { reportStatus(message, state); }
         function draft() {
-            var next = Object.assign({}, cfg, { enabled: field('enabled').checked, baseUrl: field('base').value, model: field('model').value,
-                mode: field('mode').value, hotkeys: hotkeyFields(), answerDelayMs: Number(field('answerDelay').value) * 1000, overwritePolicy: field('overwritePolicy').value, panelOpacity: panelOpacity });
+            var next = { baseUrl: field('base').value, model: field('model').value, mode: field('mode').value, hotkeys: hotkeyFields(),
+                answerDelayMs: Number(field('answerDelay').value) * 1000, overwritePolicy: field('overwritePolicy').value };
             if (field('key').value) next.apiKey = field('key').value;
             return next;
         }
         async function apply() {
-            var next = await persistConfig(draft()); next.panelOpacity = panelOpacity; next.enabled = cfg.enabled; next.universalScriptEnabled = cfg.universalScriptEnabled; next.bankAnswerMode = cfg.bankAnswerMode; next.answeringPaused = cfg.answeringPaused; configure(next); field('key').value = ''; field('enabled').checked = enabled();
+            var changes = draft();
+            Object.keys(changes).forEach(function (key) {
+                if (key === 'apiKey') return;
+                if (key === 'hotkeys' ? JSON.stringify(changes[key]) === JSON.stringify(cfg[key]) : changes[key] === cfg[key]) delete changes[key];
+            });
+            await persistConfig(changes);
+            configure(Object.assign({}, cfg, changes));
+            if (field('key').value === changes.apiKey) field('key').value = '';
+            syncPanelFields(); field('enabled').checked = enabled();
             field('key').placeholder = cfg.apiKey ? '已配置，留空保留当前 Key' : '输入 Key，留空保留已配置值';
             showStatus(enabled() && cfg.apiKey ? `已保存 · 每题填入后间隔 ${cfg.answerDelayMs / 1000} 秒` : '已保存到 config.json' + (cfg.apiKey ? '' : ' · 尚未配置 Key'), 'success');
         }
@@ -1724,7 +2536,7 @@
         field('test').onclick = async function () {
             if (field('test').disabled) return;
             field('test').disabled = true; field('test').textContent = '连接中…'; showStatus('正在测试连接…');
-            try { await testConnection(draft()); showStatus('连接正常 · 未验证识图', 'success'); }
+            try { await testConnection(Object.assign({}, cfg, draft())); showStatus('连接正常 · 未验证识图', 'success'); }
             catch (e) { showStatus(e.message || '连接测试失败', 'error'); }
             finally { field('test').disabled = false; field('test').textContent = '测试连接'; }
         };
@@ -1736,8 +2548,9 @@
             field('hotkeySave').disabled = true;
             try {
                 var values = hotkeyFields();
-                var saved = await persistConfig(Object.assign({}, diskConfig, { hotkeys: values }));
+                var saved = await persistConfig({ hotkeys: values });
                 configure(Object.assign({}, cfg, { hotkeys: saved.hotkeys }));
+                syncPanelFields();
                 if (hotkeySyncState === 'failed') await queueNativeHotkeySync(); else await nativeHotkeyJob;
                 showStatus(hotkeySyncState === 'failed' ? '快捷键已保存到磁盘，但原生同步失败，请重试或重启客户端' : hotkeySyncState === 'unavailable' ? '快捷键已保存，当前环境仅页面生效；更新 DLL 后支持原生捕获' : '快捷键已保存并生效', hotkeySyncState === 'failed' ? 'error' : 'success');
             } catch (error) { showStatus(error.message, 'error'); }
@@ -1748,11 +2561,13 @@
             if (w.__cxUpstreamAI && w.__cxUpstreamAI.retryFailed) w.__cxUpstreamAI.retryFailed();
             else showStatus('当前页面尚未加载答题模块', 'error');
         };
-        field('retry').onclick = function () { clear('用户重试'); clearProgress(); stats.status = enabled() ? 'idle' : 'disabled'; stats.lastCode = null; showStatus('缓存已清除，可按鼠标中键重新答题'); };
+        field('retry').onclick = function () { clear('用户重试', true); clearProgress(); stats.status = enabled() ? 'idle' : 'disabled'; stats.lastCode = null; showStatus('答题缓存已清除，可按鼠标中键重新答题'); };
         field('clear').onclick = async function () {
             try {
-                var next = Object.assign({}, cfg, { apiKey: '', enabled: false });
-                await persistConfig(next); next.panelOpacity = panelOpacity; next.answeringPaused = cfg.answeringPaused; configure(next); field('key').value = ''; field('enabled').checked = false;
+                var changes = { apiKey: '', enabled: false };
+                await persistConfig(changes);
+                configure(Object.assign({}, cfg, changes));
+                field('key').value = ''; field('enabled').checked = false;
                 showStatus('config.json 中的 Key 已清除', 'success');
             } catch (e) { notify(e); }
         };
@@ -1768,15 +2583,15 @@
         field('askSelection').onpointerdown = function (e) { e.preventDefault(); }; field('askSelection').onclick = function () { askSelection(); };
         field('captureRegion').onclick = captureRegion;
         field('resetBounds').onclick = function () { cfg.panelBounds = null; restoreBounds(); rememberBounds(); };
-        field('chatClear').onclick = function () { if (!chatBusy) { chatHistory = []; chatImages = []; renderChat(); } };
+        field('chatClear').onclick = function () { if (!chatBusy) { chatHistory = []; chatImages = []; chatDraftVersion++; chatPasteJob = null; renderChat(); } };
         doc.body.appendChild(host); setOpacity(panelOpacity, false); restoreBounds(); renderImagePreviews();
         field('dismiss').focus({ preventScroll: true });
         field('key').placeholder = cfg.apiKey ? '已配置，留空保留当前 Key' : '输入 Key，留空保留已配置值';
         renderProgress(); renderChat(); renderRequestStats(); updatePauseControl(answeringPaused());
         showStatus(lastStatus.message || (stats.lastCode ? '上次状态：' + stats.lastCode : ''), lastStatus.state);
     }
-    w.__cefDeepSeek = { enabled: enabled, answeringEnabled: answeringEnabled, cleanQuestionStem: cleanQuestionStem, mode: function () { return cfg.mode; }, configure: configure, persistConfig: persistConfig, answer: answer, judgeValue: judgeValue, rememberPause: rememberPause,
-        requestText: requestText, chat: chat, stopChat: stopChat, askSelection: askSelection, captureRegion: captureRegion, testConnection: testConnection, refreshBalance: refreshBalance,
+    w.__cefDeepSeek = { enabled: enabled, answeringEnabled: answeringEnabled, cleanQuestionStem: cleanQuestionStem, mode: function () { return cfg.mode; }, configure: configure, persistConfig: persistConfig, answer: answer, judgeValue: judgeValue, rememberPause: rememberPause, bankDataIsCurrent: bankDataIsCurrent,
+        requestText: requestText, chat: chat, stopChat: stopChat, askSelection: askSelection, selectedText: function () { return selectedText(w, true); }, captureRegion: captureRegion, testConnection: testConnection, refreshBalance: refreshBalance,
         prepareSelection: prepareSelection, recordHotkey: recordHotkey, handleHotkey: handleHotkey,
         status: safeStatus, openSettings: openSettings, toggleSettings: toggleSettings, hideSettings: hideSettings,
         clear: clear, notify: notify, reportStatus: reportStatus, progress: reportProgress, clearProgress: clearProgress, fillText: fillText };
